@@ -1,6 +1,8 @@
 import torch.nn as nn
 
-from mmdet.core import bbox2result
+from mmdet.core import bbox2result, tensor2imgs
+from mmdet.core.utils.summary import (add_summary, add_image_summary, every_n_local_step,
+                                      add_feature_summary)
 from .. import builder
 from ..registry import DETECTORS
 from .base import BaseDetector
@@ -52,7 +54,7 @@ class SingleStageDetector(BaseDetector):
     def forward_dummy(self, img):
         """Used for computing network flops.
 
-        See `mmdetection/tools/get_flops.py`
+        See `mmedetection/tools/get_flops.py`
         """
         x = self.extract_feat(img)
         outs = self.bbox_head(x)
@@ -64,17 +66,32 @@ class SingleStageDetector(BaseDetector):
                       gt_bboxes,
                       gt_labels,
                       gt_bboxes_ignore=None):
-        x = self.extract_feat(img)
+        x = self.extract_feat(img)  # each tensor in this tuple is corresponding to a level.
+
+        if every_n_local_step(self.train_cfg.get('vis_every_n_iters', 2000)):
+            # TODO remove hardcode
+            add_image_summary(
+                'image/origin',
+                tensor2imgs(img, mean=[123.675, 116.28, 103.53], std=[57.12, 58.395, 57.375],
+                            to_rgb=True)[0],
+                gt_bboxes[0].cpu(),
+                gt_labels[0].cpu())
+            if isinstance(x[0], tuple):
+                feature_p = x[0]
+            else:
+                feature_p = x
+            add_feature_summary('feature/x', feature_p[-1].detach().cpu().numpy())
+
         outs = self.bbox_head(x)
         loss_inputs = outs + (gt_bboxes, gt_labels, img_metas, self.train_cfg)
         losses = self.bbox_head.loss(
             *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
         return losses
 
-    def simple_test(self, img, img_metas, rescale=False):
+    def simple_test(self, img, img_meta, rescale=False):
         x = self.extract_feat(img)
         outs = self.bbox_head(x)
-        bbox_inputs = outs + (img_metas, self.test_cfg, rescale)
+        bbox_inputs = outs + (img_meta, self.test_cfg, rescale)
         bbox_list = self.bbox_head.get_bboxes(*bbox_inputs)
         bbox_results = [
             bbox2result(det_bboxes, det_labels, self.bbox_head.num_classes)
@@ -84,3 +101,8 @@ class SingleStageDetector(BaseDetector):
 
     def aug_test(self, imgs, img_metas, rescale=False):
         raise NotImplementedError
+
+    def dummy_forward(self, img, **kwargs):
+        x = self.extract_feat(img)
+        outs = self.bbox_head(x)
+        return outs

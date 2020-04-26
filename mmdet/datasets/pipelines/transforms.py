@@ -156,11 +156,7 @@ class Resize(object):
                     mmcv.imresize(mask, mask_size, interpolation='nearest')
                     for mask in results[key]
                 ]
-            if masks:
-                results[key] = np.stack(masks)
-            else:
-                results[key] = np.empty(
-                    (0, ) + results['img_shape'], dtype=np.uint8)
+            results[key] = masks
 
     def _resize_seg(self, results):
         for key in results.get('seg_fields', []):
@@ -249,15 +245,10 @@ class RandomFlip(object):
                                               results['flip_direction'])
             # flip masks
             for key in results.get('mask_fields', []):
-                masks = [
+                results[key] = [
                     mmcv.imflip(mask, direction=results['flip_direction'])
                     for mask in results[key]
                 ]
-                if masks:
-                    results[key] = np.stack(masks)
-                else:
-                    results[key] = np.empty(
-                        (0, ) + results['img_shape'], dtype=np.uint8)
 
             # flip segs
             for key in results.get('seg_fields', []):
@@ -293,7 +284,7 @@ class Pad(object):
 
     def _pad_img(self, results):
         if self.size is not None:
-            padded_img = mmcv.impad(results['img'], self.size, self.pad_val)
+            padded_img = mmcv.impad(results['img'], self.size)
         elif self.size_divisor is not None:
             padded_img = mmcv.impad_to_multiple(
                 results['img'], self.size_divisor, pad_val=self.pad_val)
@@ -419,12 +410,7 @@ class RandomCrop(object):
                     gt_mask = results['gt_masks'][i][crop_y1:crop_y2,
                                                      crop_x1:crop_x2]
                     valid_gt_masks.append(gt_mask)
-
-                if valid_gt_masks:
-                    results['gt_masks'] = np.stack(valid_gt_masks)
-                else:
-                    results['gt_masks'] = np.empty(
-                        (0, ) + results['img_shape'], dtype=np.uint8)
+                results['gt_masks'] = valid_gt_masks
 
         return results
 
@@ -490,9 +476,6 @@ class PhotoMetricDistortion(object):
 
     def __call__(self, results):
         img = results['img']
-        assert img.dtype == np.float32, \
-            'PhotoMetricDistortion needs the input image of dtype np.float32,'\
-            ' please set "to_float32=True" in "LoadImageFromFile" pipeline'
         # random brightness
         if random.randint(2):
             delta = random.uniform(-self.brightness_delta,
@@ -543,10 +526,8 @@ class PhotoMetricDistortion(object):
         repr_str = self.__class__.__name__
         repr_str += ('(brightness_delta={}, contrast_range={}, '
                      'saturation_range={}, hue_delta={})').format(
-                         self.brightness_delta,
-                         (self.contrast_lower, self.contrast_upper),
-                         (self.saturation_lower, self.saturation_upper),
-                         self.hue_delta)
+                         self.brightness_delta, self.contrast_range,
+                         self.saturation_range, self.hue_delta)
         return repr_str
 
 
@@ -605,12 +586,7 @@ class Expand(object):
                                       0).astype(mask.dtype)
                 expand_mask[top:top + h, left:left + w] = mask
                 expand_gt_masks.append(expand_mask)
-
-            if expand_gt_masks:
-                results['gt_masks'] = np.stack(expand_gt_masks)
-            else:
-                results['gt_masks'] = np.empty(
-                    (0, ) + results['img_shape'], dtype=np.uint8)
+            results['gt_masks'] = expand_gt_masks
 
         # not tested
         if 'gt_semantic_seg' in results:
@@ -646,7 +622,6 @@ class MinIoURandomCrop(object):
 
     def __init__(self, min_ious=(0.1, 0.3, 0.5, 0.7, 0.9), min_crop_size=0.3):
         # 1: return ori img
-        self.min_ious = min_ious
         self.sample_mode = (1, *min_ious, 0)
         self.min_crop_size = min_crop_size
 
@@ -676,45 +651,37 @@ class MinIoURandomCrop(object):
                     (int(left), int(top), int(left + new_w), int(top + new_h)))
                 overlaps = bbox_overlaps(
                     patch.reshape(-1, 4), boxes.reshape(-1, 4)).reshape(-1)
-                if len(overlaps) > 0 and overlaps.min() < min_iou:
+                if overlaps.min() < min_iou:
                     continue
 
                 # center of boxes should inside the crop img
-                # only adjust boxes and instance masks when the gt is not empty
-                if len(overlaps) > 0:
-                    # adjust boxes
-                    center = (boxes[:, :2] + boxes[:, 2:]) / 2
-                    mask = ((center[:, 0] > patch[0]) *
-                            (center[:, 1] > patch[1]) *
-                            (center[:, 0] < patch[2]) *
-                            (center[:, 1] < patch[3]))
-                    if not mask.any():
-                        continue
+                center = (boxes[:, :2] + boxes[:, 2:]) / 2
+                mask = ((center[:, 0] > patch[0]) * (center[:, 1] > patch[1]) *
+                        (center[:, 0] < patch[2]) * (center[:, 1] < patch[3]))
+                if not mask.any():
+                    continue
+                boxes = boxes[mask]
+                labels = labels[mask]
 
-                    boxes = boxes[mask]
-                    labels = labels[mask]
-
-                    boxes[:, 2:] = boxes[:, 2:].clip(max=patch[2:])
-                    boxes[:, :2] = boxes[:, :2].clip(min=patch[:2])
-                    boxes -= np.tile(patch[:2], 2)
-
-                    results['gt_bboxes'] = boxes
-                    results['gt_labels'] = labels
-
-                    if 'gt_masks' in results:
-                        valid_masks = [
-                            results['gt_masks'][i] for i in range(len(mask))
-                            if mask[i]
-                        ]
-                        # here the valid_masks is not empty
-                        results['gt_masks'] = np.stack([
-                            gt_mask[patch[1]:patch[3], patch[0]:patch[2]]
-                            for gt_mask in valid_masks
-                        ])
-
-                # adjust the img no matter whether the gt is empty before crop
+                # adjust boxes
                 img = img[patch[1]:patch[3], patch[0]:patch[2]]
+                boxes[:, 2:] = boxes[:, 2:].clip(max=patch[2:])
+                boxes[:, :2] = boxes[:, :2].clip(min=patch[:2])
+                boxes -= np.tile(patch[:2], 2)
+
                 results['img'] = img
+                results['gt_bboxes'] = boxes
+                results['gt_labels'] = labels
+
+                if 'gt_masks' in results:
+                    valid_masks = [
+                        results['gt_masks'][i] for i in range(len(mask))
+                        if mask[i]
+                    ]
+                    results['gt_masks'] = [
+                        gt_mask[patch[1]:patch[3], patch[0]:patch[2]]
+                        for gt_mask in valid_masks
+                    ]
 
                 # not tested
                 if 'gt_semantic_seg' in results:
@@ -812,10 +779,10 @@ class Albu(object):
         Returns:
             obj: The constructed object.
         """
-        assert isinstance(cfg, dict) and 'type' in cfg
+        assert isinstance(cfg, dict) and "type" in cfg
         args = cfg.copy()
 
-        obj_type = args.pop('type')
+        obj_type = args.pop("type")
         if mmcv.is_str(obj_type):
             if albumentations is None:
                 raise RuntimeError('albumentations is not installed')
@@ -871,10 +838,11 @@ class Albu(object):
             if isinstance(results['bboxes'], list):
                 results['bboxes'] = np.array(
                     results['bboxes'], dtype=np.float32)
-            results['bboxes'] = results['bboxes'].reshape(-1, 4)
 
             # filter label_fields
             if self.filter_lost_elements:
+
+                results['idx_mapper'] = np.arange(len(results['bboxes']))
 
                 for label in self.origin_label_fields:
                     results[label] = np.array(
@@ -890,7 +858,6 @@ class Albu(object):
         if 'gt_labels' in results:
             if isinstance(results['gt_labels'], list):
                 results['gt_labels'] = np.array(results['gt_labels'])
-            results['gt_labels'] = results['gt_labels'].astype(np.int64)
 
         # back to the original format
         results = self.mapper(results, self.keymap_back)
@@ -903,5 +870,5 @@ class Albu(object):
 
     def __repr__(self):
         repr_str = self.__class__.__name__
-        repr_str += '(transforms={})'.format(self.transforms)
+        repr_str += '(transformations={})'.format(self.transformations)
         return repr_str

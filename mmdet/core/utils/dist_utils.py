@@ -22,6 +22,7 @@ def _allreduce_coalesced(tensors, world_size, bucket_size_mb=-1):
     for bucket in buckets:
         flat_tensors = _flatten_dense_tensors(bucket)
         dist.all_reduce(flat_tensors)
+        # all_reduce perform SUM by default and we div gpu_num here.
         flat_tensors.div_(world_size)
         for tensor, synced in zip(
                 bucket, _unflatten_dense_tensors(flat_tensors, bucket)):
@@ -51,6 +52,31 @@ class DistOptimizerHook(OptimizerHook):
     def after_train_iter(self, runner):
         runner.optimizer.zero_grad()
         runner.outputs['loss'].backward()
+        allreduce_grads(runner.model.parameters(), self.coalesce,
+                        self.bucket_size_mb)
         if self.grad_clip is not None:
             self.clip_grads(runner.model.parameters())
         runner.optimizer.step()
+
+
+class DistSearchOptimizerHook(OptimizerHook):
+
+    def __init__(self, grad_clip=None, coalesce=True, bucket_size_mb=-1):
+        self.grad_clip = grad_clip
+        self.coalesce = coalesce
+        self.bucket_size_mb = bucket_size_mb
+
+    def after_train_iter(self, runner):
+        return
+
+    def after_val_iter(self, runner):
+        if runner.mode != 'train':
+            return
+        runner.search_optimizer.zero_grad()
+        runner.search_outputs['loss'].backward()
+        model = getattr(runner.model, 'module', runner.model)
+        allreduce_grads(model.arch_parameters(), self.coalesce,
+                        self.bucket_size_mb)
+        if self.grad_clip is not None:
+            self.clip_grads(model.arch_parameters())
+        runner.search_optimizer.step()

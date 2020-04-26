@@ -100,6 +100,15 @@ class SSDHead(AnchorHead):
                 xavier_init(m, distribution='uniform', bias=0)
 
     def forward(self, feats):
+        """
+        SSD500: Backbone takes 13.18ms, Head takes 2.92ms, consuming 16.10ms in total.
+
+        Args:
+            feats: tuple(tensor).
+
+        Returns:
+
+        """
         cls_scores = []
         bbox_preds = []
         for feat, reg_conv, cls_conv in zip(feats, self.reg_convs,
@@ -108,8 +117,8 @@ class SSDHead(AnchorHead):
             bbox_preds.append(reg_conv(feat))
         return cls_scores, bbox_preds
 
-    def loss_single(self, cls_score, bbox_pred, labels, label_weights,
-                    bbox_targets, bbox_weights, num_total_samples, cfg):
+    def loss_single_level(self, cls_score, bbox_pred, labels, label_weights,
+                          bbox_targets, bbox_weights, num_total_samples, cfg):
         loss_cls_all = F.cross_entropy(
             cls_score, labels, reduction='none') * label_weights
         pos_inds = (labels > 0).nonzero().view(-1)
@@ -189,7 +198,7 @@ class SSDHead(AnchorHead):
             'bbox predications become infinite or NaN!'
 
         losses_cls, losses_bbox = multi_apply(
-            self.loss_single,
+            self.loss_single_level,
             all_cls_scores,
             all_bbox_preds,
             all_labels,
@@ -198,4 +207,5 @@ class SSDHead(AnchorHead):
             all_bbox_weights,
             num_total_samples=num_total_pos,
             cfg=cfg)
-        return dict(loss_cls=losses_cls, loss_bbox=losses_bbox)
+        return {'rpn_losses/cls_loss': losses_cls,
+                'rpn_losses/bbox_loss': losses_bbox}

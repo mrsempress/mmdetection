@@ -221,3 +221,37 @@ def distance2bbox(points, distance, max_shape=None):
         x2 = x2.clamp(min=0, max=max_shape[1] - 1)
         y2 = y2.clamp(min=0, max=max_shape[0] - 1)
     return torch.stack([x1, y1, x2, y2], -1)
+
+
+def point_to_center(bboxes, start_axis=0, split=False, keep_axis=False):
+    bboxes = bboxes.to(torch.float32)
+    w = (bboxes[:, start_axis + 2] - bboxes[:, start_axis])
+    h = (bboxes[:, start_axis + 3] - bboxes[:, start_axis + 1])
+    x = bboxes[:, start_axis] + w / 2.
+    y = bboxes[:, start_axis + 1] + h / 2.
+    if split:
+        if keep_axis:
+            x, y, w, h = (x.unsqueeze(-1), y.unsqueeze(-1), w.unsqueeze(-1), h.unsqueeze(-1))
+        return x, y, w, h
+    return torch.stack((x, y, w, h), 1)
+
+
+def center_to_point(*args, use_int=True, split=True):
+    assert len(args) in (1, 4)
+    if len(args) == 1:
+        x, y, h, w = args[0].split(1, dim=-1)
+    else:
+        x, y, w, h = args
+    x1, y1, x2, y2 = (x - w / 2.), (y - h / 2.), (x + w / 2.), (y + h / 2.)
+    if use_int:
+        x1 = x1.round().to(torch.int)
+        y1 = y1.round().to(torch.int)
+        x2 = x2.round().to(torch.int)
+        y2 = y2.round().to(torch.int)
+    if split:
+        return x1, y1, x2, y2
+    else:
+        if len(args) == 1:
+            return torch.cat((x1, y1, x2, y2), dim=-1)
+        else:
+            return torch.stack((x1, y1, x2, y2), dim=-1)

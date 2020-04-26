@@ -4,10 +4,7 @@ import torch.nn.functional as F
 from ..registry import LOSSES
 from .utils import weighted_loss
 
-
-@weighted_loss
-def mse_loss(pred, target):
-    return F.mse_loss(pred, target, reduction='none')
+mse_loss = weighted_loss(F.mse_loss)
 
 
 @LOSSES.register_module

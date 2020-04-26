@@ -64,6 +64,7 @@ class AnchorGenerator(object):
             return yy, xx
 
     def grid_anchors(self, featmap_size, stride=16, device='cuda'):
+        # tile the anchors at a single position to the whole feature map.
         base_anchors = self.base_anchors.to(device)
 
         feat_h, feat_w = featmap_size
@@ -83,6 +84,7 @@ class AnchorGenerator(object):
         return all_anchors
 
     def valid_flags(self, featmap_size, valid_size, device='cuda'):
+        # featmap_size is same as one in grid_anchors.
         feat_h, feat_w = featmap_size
         valid_h, valid_w = valid_size
         assert valid_h <= feat_h and valid_w <= feat_w

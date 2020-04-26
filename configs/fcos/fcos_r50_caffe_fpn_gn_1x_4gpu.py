@@ -9,6 +9,7 @@ model = dict(
         out_indices=(0, 1, 2, 3),
         frozen_stages=1,
         norm_cfg=dict(type='BN', requires_grad=False),
+        add_summay_every_n_step=500,
         style='caffe'),
     neck=dict(
         type='FPN',
@@ -100,7 +101,6 @@ data = dict(
         ann_file=data_root + 'annotations/instances_val2017.json',
         img_prefix=data_root + 'val2017/',
         pipeline=test_pipeline))
-evaluation = dict(interval=1, metric='bbox')
 # optimizer
 optimizer = dict(
     type='SGD',
@@ -116,14 +116,17 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     step=[8, 11])
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(save_every_n_steps=2000, max_to_keep=1, keep_every_n_epochs=100)
+neck_hist_config = dict(
+    model_type=['Conv2d'],
+    sub_modules=['neck'],
+    save_every_n_steps=500)
+bbox_head_hist_config = dict(
+    model_type=['GN', 'Conv2d'],
+    sub_modules=['bbox_head'],
+    save_every_n_steps=500)
 # yapf:disable
-log_config = dict(
-    interval=50,
-    hooks=[
-        dict(type='TextLoggerHook'),
-        # dict(type='TensorboardLoggerHook')
-    ])
+log_config = dict(interval=100)
 # yapf:enable
 # runtime settings
 total_epochs = 12

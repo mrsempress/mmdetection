@@ -1,6 +1,7 @@
 import mmcv
 
 from mmdet.core import bbox_mapping, tensor2imgs
+from mmdet.core.utils.summary import add_image_summary, every_n_local_step
 from .. import builder
 from ..registry import DETECTORS
 from .base import BaseDetector
@@ -45,27 +46,31 @@ class RPN(BaseDetector, RPNTestMixin):
 
     def forward_train(self,
                       img,
-                      img_metas,
+                      img_meta,
                       gt_bboxes=None,
+                      gt_labels=None,
                       gt_bboxes_ignore=None):
-        if self.train_cfg.rpn.get('debug', False):
-            self.rpn_head.debug_imgs = tensor2imgs(img)
+        if every_n_local_step(self.train_cfg.get('vis_every_n_iters', 2000)):
+            add_image_summary(
+                'image/origin',
+                tensor2imgs(img, mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])[0],
+                gt_bboxes[0].cpu().numpy(),
+                gt_labels[0].cpu().numpy())
 
         x = self.extract_feat(img)
         rpn_outs = self.rpn_head(x)
 
-        rpn_loss_inputs = rpn_outs + (gt_bboxes, img_metas, self.train_cfg.rpn)
+        rpn_loss_inputs = rpn_outs + (gt_bboxes, img_meta, self.train_cfg.rpn)
         losses = self.rpn_head.loss(
             *rpn_loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
         return losses
 
-    def simple_test(self, img, img_metas, rescale=False):
+    def simple_test(self, img, img_meta, rescale=False):
         x = self.extract_feat(img)
-        proposal_list = self.simple_test_rpn(x, img_metas, self.test_cfg.rpn)
+        proposal_list = self.simple_test_rpn(x, img_meta, self.test_cfg.rpn)
         if rescale:
-            for proposals, meta in zip(proposal_list, img_metas):
+            for proposals, meta in zip(proposal_list, img_meta):
                 proposals[:, :4] /= meta['scale_factor']
-        # TODO: remove this restriction
         return proposal_list[0].cpu().numpy()
 
     def aug_test(self, imgs, img_metas, rescale=False):
@@ -78,7 +83,6 @@ class RPN(BaseDetector, RPNTestMixin):
                 flip = img_meta['flip']
                 proposals[:, :4] = bbox_mapping(proposals[:, :4], img_shape,
                                                 scale_factor, flip)
-        # TODO: remove this restriction
         return proposal_list[0].cpu().numpy()
 
     def show_result(self, data, result, dataset=None, top_k=20):
@@ -88,7 +92,7 @@ class RPN(BaseDetector, RPNTestMixin):
         batch size.
         """
         img_tensor = data['img'][0]
-        img_metas = data['img_metas'][0].data[0]
+        img_metas = data['img_meta'][0].data[0]
         imgs = tensor2imgs(img_tensor, **img_metas[0]['img_norm_cfg'])
         assert len(imgs) == len(img_metas)
         for img, img_meta in zip(imgs, img_metas):

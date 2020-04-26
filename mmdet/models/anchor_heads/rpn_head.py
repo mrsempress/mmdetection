@@ -12,22 +12,32 @@ from .anchor_head import AnchorHead
 @HEADS.register_module
 class RPNHead(AnchorHead):
 
-    def __init__(self, in_channels, **kwargs):
+    def __init__(self, in_channels, use_separable_5x5=False, **kwargs):
+        self.use_separable_5x5 = use_separable_5x5
         super(RPNHead, self).__init__(2, in_channels, **kwargs)
 
     def _init_layers(self):
-        self.rpn_conv = nn.Conv2d(
-            self.in_channels, self.feat_channels, 3, padding=1)
-        self.rpn_cls = nn.Conv2d(self.feat_channels,
-                                 self.num_anchors * self.cls_out_channels, 1)
+        if not self.use_separable_5x5:
+            self.rpn_conv = nn.Conv2d(self.in_channels, self.feat_channels, 3, padding=1)
+        else:
+            self.rpn_conv = nn.Sequential(
+                nn.Conv2d(self.in_channels, self.in_channels, 5, padding=2,
+                          groups=self.in_channels),
+                nn.Conv2d(self.in_channels, self.feat_channels, 1)
+            )
+        self.rpn_cls = nn.Conv2d(self.feat_channels, self.num_anchors * self.cls_out_channels, 1)
         self.rpn_reg = nn.Conv2d(self.feat_channels, self.num_anchors * 4, 1)
 
     def init_weights(self):
-        normal_init(self.rpn_conv, std=0.01)
+        if not self.use_separable_5x5:
+            normal_init(self.rpn_conv, std=0.01)
+        else:
+            normal_init(self.rpn_conv[0], std=0.01)
+            normal_init(self.rpn_conv[1], std=0.01)
         normal_init(self.rpn_cls, std=0.01)
         normal_init(self.rpn_reg, std=0.01)
 
-    def forward_single(self, x):
+    def forward_single_level(self, x, idx):
         x = self.rpn_conv(x)
         x = F.relu(x, inplace=True)
         rpn_cls_score = self.rpn_cls(x)
@@ -49,17 +59,17 @@ class RPNHead(AnchorHead):
             img_metas,
             cfg,
             gt_bboxes_ignore=gt_bboxes_ignore)
-        return dict(
-            loss_rpn_cls=losses['loss_cls'], loss_rpn_bbox=losses['loss_bbox'])
+        return {'losses/rpn_loss_cls': losses['losses/loss_cls'],
+                'losses/rpn_loss_bbox': losses['losses/loss_bbox']}
 
-    def get_bboxes_single(self,
-                          cls_scores,
-                          bbox_preds,
-                          mlvl_anchors,
-                          img_shape,
-                          scale_factor,
-                          cfg,
-                          rescale=False):
+    def get_bboxes_single_image(self,
+                                cls_scores,
+                                bbox_preds,
+                                mlvl_anchors,
+                                img_shape,
+                                scale_factor,
+                                cfg,
+                                rescale=False):
         mlvl_proposals = []
         for idx in range(len(cls_scores)):
             rpn_cls_score = cls_scores[idx]

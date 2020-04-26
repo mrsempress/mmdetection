@@ -16,7 +16,8 @@ def anchor_target(anchor_list,
                   label_channels=1,
                   sampling=True,
                   unmap_outputs=True):
-    """Compute regression and classification targets for anchors.
+    """Compute regression and classification targets for anchors. It's a multi-image
+    wrapper of anchor_target_single_image.
 
     Args:
         anchor_list (list[list]): Multi level anchors of each image.
@@ -28,39 +29,40 @@ def anchor_target(anchor_list,
         cfg (dict): RPN train configs.
 
     Returns:
-        tuple
+        tuple, each for one level.
     """
     num_imgs = len(img_metas)
     assert len(anchor_list) == len(valid_flag_list) == num_imgs
 
-    # anchor number of multi levels
+    # total anchor number of multi levels in one image.
     num_level_anchors = [anchors.size(0) for anchors in anchor_list[0]]
-    # concat all level anchors and flags to a single tensor
+    # concat all level anchors and flags to a single tensor, then handle it over
+    # to the anchor_target_single_image.
     for i in range(num_imgs):
         assert len(anchor_list[i]) == len(valid_flag_list[i])
-        anchor_list[i] = torch.cat(anchor_list[i])
-        valid_flag_list[i] = torch.cat(valid_flag_list[i])
+        anchor_list[i] = torch.cat(anchor_list[i])  # N,
+        valid_flag_list[i] = torch.cat(valid_flag_list[i])  # N,
 
-    # compute targets for each image
+    # compute targets of anchors for each image.
     if gt_bboxes_ignore_list is None:
         gt_bboxes_ignore_list = [None for _ in range(num_imgs)]
     if gt_labels_list is None:
         gt_labels_list = [None for _ in range(num_imgs)]
     (all_labels, all_label_weights, all_bbox_targets, all_bbox_weights,
      pos_inds_list, neg_inds_list) = multi_apply(
-         anchor_target_single,
-         anchor_list,
-         valid_flag_list,
-         gt_bboxes_list,
-         gt_bboxes_ignore_list,
-         gt_labels_list,
-         img_metas,
-         target_means=target_means,
-         target_stds=target_stds,
-         cfg=cfg,
-         label_channels=label_channels,
-         sampling=sampling,
-         unmap_outputs=unmap_outputs)
+        anchor_target_single_image,
+        anchor_list,
+        valid_flag_list,
+        gt_bboxes_list,
+        gt_bboxes_ignore_list,
+        gt_labels_list,
+        img_metas,
+        target_means=target_means,
+        target_stds=target_stds,
+        cfg=cfg,
+        label_channels=label_channels,
+        sampling=sampling,
+        unmap_outputs=unmap_outputs)
     # no valid anchors
     if any([labels is None for labels in all_labels]):
         return None
@@ -91,36 +93,37 @@ def images_to_levels(target, num_level_anchors):
     return level_targets
 
 
-def anchor_target_single(flat_anchors,
-                         valid_flags,
-                         gt_bboxes,
-                         gt_bboxes_ignore,
-                         gt_labels,
-                         img_meta,
-                         target_means,
-                         target_stds,
-                         cfg,
-                         label_channels=1,
-                         sampling=True,
-                         unmap_outputs=True):
-    inside_flags = anchor_inside_flags(flat_anchors, valid_flags,
-                                       img_meta['img_shape'][:2],
-                                       cfg.allowed_border)
+def anchor_target_single_image(flat_anchors,
+                               valid_flags,
+                               gt_bboxes,
+                               gt_bboxes_ignore,
+                               gt_labels,
+                               img_meta,
+                               target_means,
+                               target_stds,
+                               cfg,
+                               label_channels=1,
+                               sampling=True,
+                               unmap_outputs=True):
+    # get the anchor target of a single image. flat_anchors means flattened anchors.
+    inside_flags = anchor_inside_flags(flat_anchors, valid_flags, img_meta['img_shape'][:2],
+                                       cfg.allowed_border)  # total_anchor_num,
     if not inside_flags.any():
-        return (None, ) * 6
+        return (None,) * 6
     # assign gt and sample anchors
-    anchors = flat_anchors[inside_flags.type(torch.bool), :]
+    anchors = flat_anchors[inside_flags, :]
 
     if sampling:
+        # only used in RPN. So gt_labels is not needed and it's None.
         assign_result, sampling_result = assign_and_sample(
             anchors, gt_bboxes, gt_bboxes_ignore, None, cfg)
     else:
+        # in Single-Stage detector, the anchor-target-designation will only happen
+        # once in general, and can be completed in data-prepare stage.
         bbox_assigner = build_assigner(cfg.assigner)
-        assign_result = bbox_assigner.assign(anchors, gt_bboxes,
-                                             gt_bboxes_ignore, gt_labels)
+        assign_result = bbox_assigner.assign(anchors, gt_bboxes, gt_bboxes_ignore, gt_labels)
         bbox_sampler = PseudoSampler()
-        sampling_result = bbox_sampler.sample(assign_result, anchors,
-                                              gt_bboxes)
+        sampling_result = bbox_sampler.sample(assign_result, anchors, gt_bboxes)
 
     num_valid_anchors = anchors.shape[0]
     bbox_targets = torch.zeros_like(anchors)
@@ -131,6 +134,7 @@ def anchor_target_single(flat_anchors,
     pos_inds = sampling_result.pos_inds
     neg_inds = sampling_result.neg_inds
     if len(pos_inds) > 0:
+        # calc the delta.
         pos_bbox_targets = bbox2delta(sampling_result.pos_bboxes,
                                       sampling_result.pos_gt_bboxes,
                                       target_means, target_stds)
@@ -155,8 +159,7 @@ def anchor_target_single(flat_anchors,
         bbox_targets = unmap(bbox_targets, num_total_anchors, inside_flags)
         bbox_weights = unmap(bbox_weights, num_total_anchors, inside_flags)
 
-    return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
-            neg_inds)
+    return (labels, label_weights, bbox_targets, bbox_weights, pos_inds, neg_inds)
 
 
 def anchor_inside_flags(flat_anchors,
@@ -165,6 +168,7 @@ def anchor_inside_flags(flat_anchors,
                         allowed_border=0):
     img_h, img_w = img_shape[:2]
     if allowed_border >= 0:
+        # a mask, dim: total_anchor_num,
         inside_flags = valid_flags & \
             (flat_anchors[:, 0] >= -allowed_border).type(torch.uint8) & \
             (flat_anchors[:, 1] >= -allowed_border).type(torch.uint8) & \
@@ -179,10 +183,10 @@ def unmap(data, count, inds, fill=0):
     """ Unmap a subset of item (data) back to the original set of items (of
     size count) """
     if data.dim() == 1:
-        ret = data.new_full((count, ), fill)
-        ret[inds.type(torch.bool)] = data
+        ret = data.new_full((count,), fill)
+        ret[inds] = data
     else:
-        new_size = (count, ) + data.size()[1:]
+        new_size = (count,) + data.size()[1:]
         ret = data.new_full(new_size, fill)
-        ret[inds.type(torch.bool), :] = data
+        ret[inds, :] = data
     return ret

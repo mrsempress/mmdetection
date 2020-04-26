@@ -6,10 +6,9 @@ import torch.nn as nn
 from torch.nn.modules.utils import _pair
 
 from mmdet.core import auto_fp16, force_fp32, mask_target
-from mmdet.ops import ConvModule, build_upsample_layer
-from mmdet.ops.carafe import CARAFEPack
 from ..builder import build_loss
 from ..registry import HEADS
+from ..utils import ConvModule
 
 
 @HEADS.register_module
@@ -21,30 +20,27 @@ class FCNMaskHead(nn.Module):
                  in_channels=256,
                  conv_kernel_size=3,
                  conv_out_channels=256,
+                 upsample_method='deconv',
+                 upsample_ratio=2,
                  num_classes=81,
                  class_agnostic=False,
-                 upsample_cfg=dict(type='deconv', scale_factor=2),
                  conv_cfg=None,
                  norm_cfg=None,
                  loss_mask=dict(
                      type='CrossEntropyLoss', use_mask=True, loss_weight=1.0)):
         super(FCNMaskHead, self).__init__()
-        self.upsample_cfg = upsample_cfg.copy()
-        if self.upsample_cfg['type'] not in [
-                None, 'deconv', 'nearest', 'bilinear', 'carafe'
-        ]:
+        if upsample_method not in [None, 'deconv', 'nearest', 'bilinear']:
             raise ValueError(
                 'Invalid upsample method {}, accepted methods '
-                'are "deconv", "nearest", "bilinear", "carafe"'.format(
-                    self.upsample_cfg['type']))
+                'are "deconv", "nearest", "bilinear"'.format(upsample_method))
         self.num_convs = num_convs
         # WARN: roi_feat_size is reserved and not used
         self.roi_feat_size = _pair(roi_feat_size)
         self.in_channels = in_channels
         self.conv_kernel_size = conv_kernel_size
         self.conv_out_channels = conv_out_channels
-        self.upsample_method = self.upsample_cfg.get('type')
-        self.scale_factor = self.upsample_cfg.pop('scale_factor')
+        self.upsample_method = upsample_method
+        self.upsample_ratio = upsample_ratio
         self.num_classes = num_classes
         self.class_agnostic = class_agnostic
         self.conv_cfg = conv_cfg
@@ -67,32 +63,24 @@ class FCNMaskHead(nn.Module):
                     norm_cfg=norm_cfg))
         upsample_in_channels = (
             self.conv_out_channels if self.num_convs > 0 else in_channels)
-        upsample_cfg_ = self.upsample_cfg.copy()
         if self.upsample_method is None:
             self.upsample = None
         elif self.upsample_method == 'deconv':
-            upsample_cfg_.update(
-                in_channels=upsample_in_channels,
-                out_channels=self.conv_out_channels,
-                kernel_size=self.scale_factor,
-                stride=self.scale_factor)
-        elif self.upsample_method == 'carafe':
-            upsample_cfg_.update(
-                channels=upsample_in_channels, scale_factor=self.scale_factor)
+            self.upsample = nn.ConvTranspose2d(
+                upsample_in_channels,
+                self.conv_out_channels,
+                self.upsample_ratio,
+                stride=self.upsample_ratio)
         else:
-            # suppress warnings
-            align_corners = (None
-                             if self.upsample_method == 'nearest' else False)
-            upsample_cfg_.update(
-                scale_factor=self.scale_factor,
-                mode=self.upsample_method,
-                align_corners=align_corners)
-        self.upsample = build_upsample_layer(upsample_cfg_)
+            self.upsample = nn.Upsample(
+                scale_factor=self.upsample_ratio, mode=self.upsample_method)
 
         out_channels = 1 if self.class_agnostic else self.num_classes
         logits_in_channel = (
             self.conv_out_channels
             if self.upsample_method == 'deconv' else upsample_in_channels)
+        # each binary mask is corresponding to a class (exclude background) in origin paper.
+        # but in most implement, background is included even the 0-th dim is discharged.
         self.conv_logits = nn.Conv2d(logits_in_channel, out_channels, 1)
         self.relu = nn.ReLU(inplace=True)
         self.debug_imgs = None
@@ -101,12 +89,9 @@ class FCNMaskHead(nn.Module):
         for m in [self.upsample, self.conv_logits]:
             if m is None:
                 continue
-            elif isinstance(m, CARAFEPack):
-                m.init_weights()
-            else:
-                nn.init.kaiming_normal_(
-                    m.weight, mode='fan_out', nonlinearity='relu')
-                nn.init.constant_(m.bias, 0)
+            nn.init.kaiming_normal_(
+                m.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.constant_(m.bias, 0)
 
     @auto_fp16()
     def forward(self, x):
@@ -187,22 +172,14 @@ class FCNMaskHead(nn.Module):
                 mask_pred_ = mask_pred[i, label, :, :]
             else:
                 mask_pred_ = mask_pred[i, 0, :, :]
+            im_mask = np.zeros((img_h, img_w), dtype=np.uint8)
 
             bbox_mask = mmcv.imresize(mask_pred_, (w, h))
             bbox_mask = (bbox_mask > rcnn_test_cfg.mask_thr_binary).astype(
                 np.uint8)
-
-            if rcnn_test_cfg.get('crop_mask', False):
-                im_mask = bbox_mask
-            else:
-                im_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                im_mask[bbox[1]:bbox[1] + h, bbox[0]:bbox[0] + w] = bbox_mask
-
-            if rcnn_test_cfg.get('rle_mask_encode', True):
-                rle = mask_util.encode(
-                    np.array(im_mask[:, :, np.newaxis], order='F'))[0]
-                cls_segms[label - 1].append(rle)
-            else:
-                cls_segms[label - 1].append(im_mask)
+            im_mask[bbox[1]:bbox[1] + h, bbox[0]:bbox[0] + w] = bbox_mask
+            rle = mask_util.encode(
+                np.array(im_mask[:, :, np.newaxis], order='F'))[0]
+            cls_segms[label - 1].append(rle)
 
         return cls_segms

@@ -51,9 +51,9 @@ def plot_curve(log_dicts, args):
         for j, metric in enumerate(metrics):
             print('plot curve of {}, metric is {}'.format(
                 args.json_logs[i], metric))
-            if metric not in log_dict[epochs[0]]:
-                raise KeyError('{} does not contain metric {}'.format(
-                    args.json_logs[i], metric))
+            assert metric in log_dict[epochs[
+                0]], '{} does not contain metric {}'.format(
+                    args.json_logs[i], metric)
 
             if 'mAP' in metric:
                 xs = np.arange(1, max(epochs) + 1)
@@ -154,9 +154,6 @@ def load_json_logs(json_logs):
         with open(json_log, 'r') as log_file:
             for l in log_file:
                 log = json.loads(l.strip())
-                # skip lines without `epoch` field
-                if 'epoch' not in log:
-                    continue
                 epoch = log.pop('epoch')
                 if epoch not in log_dict:
                     log_dict[epoch] = defaultdict(list)

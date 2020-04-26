@@ -15,10 +15,16 @@ from .retinanet import RetinaNet
 from .rpn import RPN
 from .single_stage import SingleStageDetector
 from .two_stage import TwoStageDetector
+from .yolov3 import YOLOv3
+from .centernet import CenterNet
+from .ttfnet import TTFNet
+from .search_base import SearchBaseDetector
+from .ttfnext import TTFNeXt
 
 __all__ = [
     'ATSS', 'BaseDetector', 'SingleStageDetector', 'TwoStageDetector', 'RPN',
     'FastRCNN', 'FasterRCNN', 'MaskRCNN', 'CascadeRCNN', 'HybridTaskCascade',
     'DoubleHeadRCNN', 'RetinaNet', 'FCOS', 'GridRCNN', 'MaskScoringRCNN',
-    'RepPointsDetector', 'FOVEA'
+    'RepPointsDetector', 'FOVEA', 'YOLOv3', 'CenterNet', 'TTFNet', 'SearchBaseDetector',
+    'TTFNeXt'
 ]

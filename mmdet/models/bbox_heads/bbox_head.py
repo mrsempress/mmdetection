@@ -5,6 +5,7 @@ from torch.nn.modules.utils import _pair
 
 from mmdet.core import (auto_fp16, bbox_target, delta2bbox, force_fp32,
                         multiclass_nms)
+from mmdet.core.utils.summary import add_summary
 from ..builder import build_loss
 from ..losses import accuracy
 from ..registry import HEADS
@@ -61,7 +62,6 @@ class BBoxHead(nn.Module):
         self.debug_imgs = None
 
     def init_weights(self):
-        # conv layers are already initialized by ConvModule
         if self.with_cls:
             nn.init.normal_(self.fc_cls.weight, 0, 0.01)
             nn.init.constant_(self.fc_cls.bias, 0)
@@ -96,6 +96,24 @@ class BBoxHead(nn.Module):
             target_stds=self.target_stds)
         return cls_reg_targets
 
+    @staticmethod
+    def label_metrics(cls_score, labels):
+        fg_mask = labels > 0
+        num_fg = torch.sum(fg_mask)
+        prediction = torch.argmax(cls_score, dim=1)
+        correct = (prediction == labels).float()
+        accuracy = torch.mean(correct).item()
+        fg_label_pred = torch.argmax(cls_score[fg_mask], dim=1)
+        num_zero = float(torch.sum(fg_label_pred == 0))
+        empty_fg = num_fg == 0
+        summary = {'accuracy': accuracy}
+        if not empty_fg:
+            fg_accuracy = torch.mean(correct[fg_mask]).item()
+            false_negative = num_zero / float(num_fg)
+            summary['fg_accuracy'] = fg_accuracy
+            summary['false_negative'] = false_negative
+        add_summary('fast_rcnn', **summary)
+
     @force_fp32(apply_to=('cls_score', 'bbox_pred'))
     def loss(self,
              cls_score,
@@ -106,31 +124,32 @@ class BBoxHead(nn.Module):
              bbox_weights,
              reduction_override=None):
         losses = dict()
+        BBoxHead.label_metrics(cls_score, labels)
+
         if cls_score is not None:
             avg_factor = max(torch.sum(label_weights > 0).float().item(), 1.)
             if cls_score.numel() > 0:
-                losses['loss_cls'] = self.loss_cls(
+                losses['losses/fast_rcnn_loss_cls'] = self.loss_cls(
                     cls_score,
                     labels,
                     label_weights,
                     avg_factor=avg_factor,
                     reduction_override=reduction_override)
-                losses['acc'] = accuracy(cls_score, labels)
+                losses['losses/fast_rcnn_acc'] = accuracy(cls_score, labels)
         if bbox_pred is not None:
             pos_inds = labels > 0
             if pos_inds.any():
                 if self.reg_class_agnostic:
-                    pos_bbox_pred = bbox_pred.view(
-                        bbox_pred.size(0), 4)[pos_inds.type(torch.bool)]
+                    pos_bbox_pred = bbox_pred.view(bbox_pred.size(0),
+                                                   4)[pos_inds]
                 else:
-                    pos_bbox_pred = bbox_pred.view(
-                        bbox_pred.size(0), -1,
-                        4)[pos_inds.type(torch.bool),
-                           labels[pos_inds.type(torch.bool)]]
-                losses['loss_bbox'] = self.loss_bbox(
+                    pos_bbox_pred = bbox_pred.view(bbox_pred.size(0), -1,
+                                                   4)[pos_inds,
+                                                      labels[pos_inds]]
+                losses['losses/fast_rcnn_loss_bbox'] = self.loss_bbox(
                     pos_bbox_pred,
-                    bbox_targets[pos_inds.type(torch.bool)],
-                    bbox_weights[pos_inds.type(torch.bool)],
+                    bbox_targets[pos_inds],
+                    bbox_weights[pos_inds],
                     avg_factor=bbox_targets.size(0),
                     reduction_override=reduction_override)
         return losses
@@ -248,7 +267,7 @@ class BBoxHead(nn.Module):
             keep_inds = pos_is_gts_.new_ones(num_rois)
             keep_inds[:len(pos_is_gts_)] = pos_keep
 
-            bboxes_list.append(bboxes[keep_inds.type(torch.bool)])
+            bboxes_list.append(bboxes[keep_inds])
 
         return bboxes_list
 

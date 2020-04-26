@@ -1,5 +1,4 @@
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <THC/THCAtomics.cuh>
 
 #define CUDA_1D_KERNEL_LOOP(i, n)                            \
@@ -62,11 +61,13 @@ __device__ scalar_t bilinear_interpolate(const scalar_t *bottom_data,
 }
 
 template <typename scalar_t>
-__global__ void ROIAlignForwardV1(
-    const int nthreads, const scalar_t *bottom_data,
-    const scalar_t *bottom_rois, const scalar_t spatial_scale,
-    const int sample_num, const int channels, const int height, const int width,
-    const int pooled_height, const int pooled_width, scalar_t *top_data) {
+__global__ void ROIAlignForward(const int nthreads, const scalar_t *bottom_data,
+                                const scalar_t *bottom_rois,
+                                const scalar_t spatial_scale,
+                                const int sample_num, const int channels,
+                                const int height, const int width,
+                                const int pooled_height, const int pooled_width,
+                                scalar_t *top_data) {
   CUDA_1D_KERNEL_LOOP(index, nthreads) {
     // (n, c, ph, pw) is an element in the aligned output
     int pw = index % pooled_width;
@@ -97,6 +98,12 @@ __global__ void ROIAlignForwardV1(
     int sample_num_w =
         (sample_num > 0) ? sample_num : ceil(roi_width / pooled_width);
 
+    scalar_t h = (scalar_t)(ph + 0.5) * bin_size_h + roi_start_h;
+    scalar_t w = (scalar_t)(pw + 0.5) * bin_size_w + roi_start_w;
+
+    int hstart = fminf(floor(h), height - 2);
+    int wstart = fminf(floor(w), width - 2);
+
     scalar_t output_val = 0;
     for (int iy = 0; iy < sample_num_h; iy++) {
       const scalar_t y = roi_start_h + ph * bin_size_h +
@@ -124,14 +131,13 @@ int ROIAlignForwardLaucher(const at::Tensor features, const at::Tensor rois,
                            at::Tensor output) {
   const int output_size = num_rois * pooled_height * pooled_width * channels;
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      features.scalar_type(), "ROIAlignLaucherForward", ([&] {
+      features.type(), "ROIAlignLaucherForward", ([&] {
         const scalar_t *bottom_data = features.data<scalar_t>();
         const scalar_t *rois_data = rois.data<scalar_t>();
         scalar_t *top_data = output.data<scalar_t>();
 
-        ROIAlignForwardV1<scalar_t>
-            <<<GET_BLOCKS(output_size), THREADS_PER_BLOCK, 0,
-               at::cuda::getCurrentCUDAStream()>>>(
+        ROIAlignForward<scalar_t>
+            <<<GET_BLOCKS(output_size), THREADS_PER_BLOCK>>>(
                 output_size, bottom_data, rois_data, scalar_t(spatial_scale),
                 sample_num, channels, height, width, pooled_height,
                 pooled_width, top_data);
@@ -185,7 +191,7 @@ __device__ void bilinear_interpolate_gradient(const int height, const int width,
 }
 
 template <typename scalar_t>
-__global__ void ROIAlignBackwardV1(
+__global__ void ROIAlignBackward(
     const int nthreads, const scalar_t *top_diff, const scalar_t *bottom_rois,
     const scalar_t spatial_scale, const int sample_num, const int channels,
     const int height, const int width, const int pooled_height,
@@ -225,6 +231,12 @@ __global__ void ROIAlignBackwardV1(
 
     const scalar_t count = (scalar_t)(sample_num_h * sample_num_w);
 
+    scalar_t h = (scalar_t)(ph + 0.5) * bin_size_h + roi_start_h;
+    scalar_t w = (scalar_t)(pw + 0.5) * bin_size_w + roi_start_w;
+
+    int hstart = fminf(floor(h), height - 2);
+    int wstart = fminf(floor(w), width - 2);
+
     for (int iy = 0; iy < sample_num_h; iy++) {
       const scalar_t y =
           roi_start_h + ph * bin_size_h +
@@ -262,7 +274,7 @@ int ROIAlignBackwardLaucher(const at::Tensor top_grad, const at::Tensor rois,
   const int output_size = num_rois * pooled_height * pooled_width * channels;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      top_grad.scalar_type(), "ROIAlignLaucherBackward", ([&] {
+      top_grad.type(), "ROIAlignLaucherBackward", ([&] {
         const scalar_t *top_diff = top_grad.data<scalar_t>();
         const scalar_t *rois_data = rois.data<scalar_t>();
         scalar_t *bottom_diff = bottom_grad.data<scalar_t>();
@@ -271,9 +283,8 @@ int ROIAlignBackwardLaucher(const at::Tensor top_grad, const at::Tensor rois,
           exit(-1);
         }
 
-        ROIAlignBackwardV1<scalar_t>
-            <<<GET_BLOCKS(output_size), THREADS_PER_BLOCK, 0,
-               at::cuda::getCurrentCUDAStream()>>>(
+        ROIAlignBackward<scalar_t>
+            <<<GET_BLOCKS(output_size), THREADS_PER_BLOCK>>>(
                 output_size, top_diff, rois_data, spatial_scale, sample_num,
                 channels, height, width, pooled_height, pooled_width,
                 bottom_diff);

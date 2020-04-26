@@ -1,14 +1,13 @@
 # model settings
 model = dict(
     type='MaskRCNN',
-    pretrained=None,
+    pretrained='modelzoo://resnet50',
     backbone=dict(
         type='ResNet',
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
         frozen_stages=1,
-        norm_cfg=dict(type='BN', requires_grad=True),
         style='pytorch'),
     neck=dict(
         type='FPN',
@@ -153,21 +152,20 @@ data = dict(
             type=dataset_type,
             ann_file=data_root +
             'annotations/instancesonly_filtered_gtFine_train.json',
-            img_prefix=data_root + 'leftImg8bit/train/',
+            img_prefix=data_root + 'train/',
             pipeline=train_pipeline)),
     val=dict(
         type=dataset_type,
         ann_file=data_root +
         'annotations/instancesonly_filtered_gtFine_val.json',
-        img_prefix=data_root + 'leftImg8bit/val/',
+        img_prefix=data_root + 'val/',
         pipeline=test_pipeline),
     test=dict(
         type=dataset_type,
         ann_file=data_root +
-        'annotations/instancesonly_filtered_gtFine_test.json',
-        img_prefix=data_root + 'leftImg8bit/test/',
+        'annotations/instancesonly_filtered_gtFine_val.json',
+        img_prefix=data_root + 'val/',
         pipeline=test_pipeline))
-evaluation = dict(interval=1, metric=['bbox', 'segm'])
 # optimizer
 # lr is set for a batch size of 8
 optimizer = dict(type='SGD', lr=0.01, momentum=0.9, weight_decay=0.0001)
@@ -178,8 +176,7 @@ lr_config = dict(
     warmup='linear',
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
-    # [7] yields higher performance than [6]
-    step=[7])
+    step=[6])
 checkpoint_config = dict(interval=1)
 # yapf:disable
 log_config = dict(
@@ -194,7 +191,6 @@ total_epochs = 8  # actual epoch = 8 * 8 = 64
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = './work_dirs/cityscapes/mask_rcnn_r50_fpn_1x_cityscapes'
-# For better, more stable performance initialize from COCO
-load_from = 'https://s3.ap-northeast-2.amazonaws.com/open-mmlab/mmdetection/models/mask_rcnn_r50_fpn_2x_20181010-41d35c05.pth'  # noqa
+load_from = None
 resume_from = None
 workflow = [('train', 1)]

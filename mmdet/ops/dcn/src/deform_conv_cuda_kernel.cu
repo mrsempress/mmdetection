@@ -58,10 +58,9 @@
  * \author Yuwen Xiong, Haozhi Qi, Jifeng Dai, Xizhou Zhu, Han Hu, Dazhi Cheng
  */
 
-// modified from https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/blob/mmdetection/mmdet/ops/dcn/src/deform_conv_cuda_kernel.cu
+// modify from https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/blob/mmdetection/mmdet/ops/dcn/src/deform_conv_cuda_kernel.cu
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <THC/THCAtomics.cuh>
 #include <stdio.h>
 #include <math.h>
@@ -257,12 +256,12 @@ void deformable_im2col(
   int channel_per_deformable_group = channels / deformable_group;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      data_im.scalar_type(), "deformable_im2col_gpu", ([&] {
+      data_im.type(), "deformable_im2col_gpu", ([&] {
         const scalar_t *data_im_ = data_im.data<scalar_t>();
         const scalar_t *data_offset_ = data_offset.data<scalar_t>();
         scalar_t *data_col_ = data_col.data<scalar_t>();
 
-        deformable_im2col_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        deformable_im2col_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS>>>(
             num_kernels, data_im_, data_offset_, height, width, ksize_h, ksize_w,
             pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
             channel_per_deformable_group, parallel_imgs, channels, deformable_group,
@@ -351,12 +350,12 @@ void deformable_col2im(
   int channel_per_deformable_group = channels / deformable_group;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      data_col.scalar_type(), "deformable_col2im_gpu", ([&] {
+      data_col.type(), "deformable_col2im_gpu", ([&] {
         const scalar_t *data_col_ = data_col.data<scalar_t>();
         const scalar_t *data_offset_ = data_offset.data<scalar_t>();
         scalar_t *grad_im_ = grad_im.data<scalar_t>();
 
-        deformable_col2im_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        deformable_col2im_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS>>>(
             num_kernels, data_col_, data_offset_, channels, height, width, ksize_h,
             ksize_w, pad_h, pad_w, stride_h, stride_w,
             dilation_h, dilation_w, channel_per_deformable_group,
@@ -449,13 +448,13 @@ void deformable_col2im_coord(
   int channel_per_deformable_group = channels * ksize_h * ksize_w / deformable_group;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      data_col.scalar_type(), "deformable_col2im_coord_gpu", ([&] {
+      data_col.type(), "deformable_col2im_coord_gpu", ([&] {
         const scalar_t *data_col_ = data_col.data<scalar_t>();
         const scalar_t *data_im_ = data_im.data<scalar_t>();
         const scalar_t *data_offset_ = data_offset.data<scalar_t>();
         scalar_t *grad_offset_ = grad_offset.data<scalar_t>();
 
-        deformable_col2im_coord_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        deformable_col2im_coord_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS>>>(
             num_kernels, data_col_, data_im_, data_offset_, channels, height, width,
             ksize_h, ksize_w, pad_h, pad_w, stride_h, stride_w,
             dilation_h, dilation_w, channel_per_deformable_group,
@@ -779,13 +778,13 @@ void modulated_deformable_im2col_cuda(
   const int num_kernels = channels * batch_size * height_col * width_col;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      data_im.scalar_type(), "modulated_deformable_im2col_gpu", ([&] {
+      data_im.type(), "modulated_deformable_im2col_gpu", ([&] {
         const scalar_t *data_im_ = data_im.data<scalar_t>();
         const scalar_t *data_offset_ = data_offset.data<scalar_t>();
         const scalar_t *data_mask_ = data_mask.data<scalar_t>();
         scalar_t *data_col_ = data_col.data<scalar_t>();
 
-        modulated_deformable_im2col_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        modulated_deformable_im2col_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS>>>(
             num_kernels, data_im_, data_offset_, data_mask_, height_im, width_im, kernel_h, kenerl_w,
             pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, channel_per_deformable_group,
             batch_size, channels, deformable_group, height_col, width_col, data_col_);
@@ -811,15 +810,15 @@ void modulated_deformable_col2im_cuda(
   const int num_kernels = channels * kernel_h * kernel_w * batch_size * height_col * width_col;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      data_col.scalar_type(), "modulated_deformable_col2im_gpu", ([&] {
+      data_col.type(), "modulated_deformable_col2im_gpu", ([&] {
         const scalar_t *data_col_ = data_col.data<scalar_t>();
         const scalar_t *data_offset_ = data_offset.data<scalar_t>();
         const scalar_t *data_mask_ = data_mask.data<scalar_t>();
         scalar_t *grad_im_ = grad_im.data<scalar_t>();
 
-        modulated_deformable_col2im_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        modulated_deformable_col2im_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS>>>(
             num_kernels, data_col_, data_offset_, data_mask_, channels, height_im, width_im,
-            kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w,
+            kernel_h, kernel_w, pad_h, pad_h, stride_h, stride_w,
             dilation_h, dilation_w, channel_per_deformable_group,
             batch_size, deformable_group, height_col, width_col, grad_im_);
       }));
@@ -844,7 +843,7 @@ void modulated_deformable_col2im_coord_cuda(
   const int channel_per_deformable_group = channels * kernel_h * kernel_w / deformable_group;
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      data_col.scalar_type(), "modulated_deformable_col2im_coord_gpu", ([&] {
+      data_col.type(), "modulated_deformable_col2im_coord_gpu", ([&] {
         const scalar_t *data_col_ = data_col.data<scalar_t>();
         const scalar_t *data_im_ = data_im.data<scalar_t>();
         const scalar_t *data_offset_ = data_offset.data<scalar_t>();
@@ -852,7 +851,7 @@ void modulated_deformable_col2im_coord_cuda(
         scalar_t *grad_offset_ = grad_offset.data<scalar_t>();
         scalar_t *grad_mask_ = grad_mask.data<scalar_t>();
 
-        modulated_deformable_col2im_coord_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        modulated_deformable_col2im_coord_gpu_kernel<<<GET_BLOCKS(num_kernels), CUDA_NUM_THREADS>>>(
             num_kernels, data_col_, data_im_, data_offset_, data_mask_, channels, height_im, width_im,
             kernel_h, kernel_w, pad_h, pad_w, stride_h, stride_w,
             dilation_h, dilation_w, channel_per_deformable_group,

@@ -7,9 +7,10 @@ from torch.nn.modules.utils import _pair
 def mask_target(pos_proposals_list, pos_assigned_gt_inds_list, gt_masks_list,
                 cfg):
     cfg_list = [cfg for _ in range(len(pos_proposals_list))]
+    # each tensor in the lists is corresponding to a single image.
     mask_targets = map(mask_target_single, pos_proposals_list,
                        pos_assigned_gt_inds_list, gt_masks_list, cfg_list)
-    mask_targets = torch.cat(list(mask_targets))
+    mask_targets = torch.cat(list(mask_targets))  # (n, mask_size, mask_size)
     return mask_targets
 
 

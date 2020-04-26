@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from mmdet import ops
 from mmdet.core import force_fp32
+from mmdet.core.utils.summary import add_summary
 from ..registry import ROI_EXTRACTORS
 
 
@@ -32,6 +33,7 @@ class SingleRoIExtractor(nn.Module):
         self.out_channels = out_channels
         self.featmap_strides = featmap_strides
         self.finest_scale = finest_scale
+        self.summary_dict = {}
         self.fp16_enabled = False
 
     @property
@@ -100,8 +102,10 @@ class SingleRoIExtractor(nn.Module):
             rois = self.roi_rescale(rois, roi_scale_factor)
         for i in range(num_levels):
             inds = target_lvls == i
+            self.summary_dict['num_roi_in_level_{}'.format(i)] = torch.sum(inds).float().item()
             if inds.any():
                 rois_ = rois[inds, :]
                 roi_feats_t = self.roi_layers[i](feats[i], rois_)
                 roi_feats[inds] = roi_feats_t
+        add_summary('roi_extractor', **self.summary_dict)
         return roi_feats

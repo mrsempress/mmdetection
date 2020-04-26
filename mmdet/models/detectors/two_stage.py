@@ -1,12 +1,15 @@
+import numpy as np
 import torch
 import torch.nn as nn
+import cv2
 
-from mmdet.core import bbox2result, bbox2roi, build_assigner, build_sampler
+from mmdet.core import bbox2result, bbox2roi, build_assigner, build_sampler, tensor2imgs
 from .. import builder
 from ..registry import DETECTORS
 from .base import BaseDetector
 from .test_mixins import BBoxTestMixin, MaskTestMixin, RPNTestMixin
-
+from mmdet.core.utils.summary import (add_summary, add_image_summary, every_n_local_step,
+                                      add_feature_summary)
 
 @DETECTORS.register_module
 class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
@@ -97,7 +100,7 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
     def forward_dummy(self, img):
         """Used for computing network flops.
 
-        See `mmdetection/tools/get_flops.py`
+        See `mmedetection/tools/get_flops.py`
         """
         outs = ()
         # backbone
@@ -106,7 +109,7 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
         if self.with_rpn:
             rpn_outs = self.rpn_head(x)
             outs = outs + (rpn_outs, )
-        proposals = torch.randn(1000, 4).to(device=img.device)
+        proposals = torch.randn(1000, 4).cuda()
         # bbox head
         rois = bbox2roi([proposals])
         if self.with_bbox:
@@ -129,7 +132,7 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
 
     def forward_train(self,
                       img,
-                      img_metas,
+                      img_meta,
                       gt_bboxes,
                       gt_labels,
                       gt_bboxes_ignore=None,
@@ -140,8 +143,8 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
             img (Tensor): of shape (N, C, H, W) encoding input images.
                 Typically these should be mean centered and std scaled.
 
-            img_metas (list[dict]): list of image info dict where each dict
-                has: 'img_shape', 'scale_factor', 'flip', and may also contain
+            img_meta (list[dict]): list of image info dict where each dict has:
+                'img_shape', 'scale_factor', 'flip', and may also contain
                 'filename', 'ori_shape', 'pad_shape', and 'img_norm_cfg'.
                 For details on the values of these keys see
                 `mmdet/datasets/pipelines/formatting.py:Collect`.
@@ -166,11 +169,18 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
         x = self.extract_feat(img)
 
         losses = dict()
+        if every_n_local_step(self.train_cfg.get('vis_every_n_iters', 2000)):
+            add_image_summary(
+                'image/origin',
+                tensor2imgs(img, mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])[0],
+                gt_bboxes[0].cpu(),
+                gt_labels[0].cpu())
+            add_feature_summary('feature/x', x[-1].detach().cpu().numpy())
 
         # RPN forward and loss
         if self.with_rpn:
             rpn_outs = self.rpn_head(x)
-            rpn_loss_inputs = rpn_outs + (gt_bboxes, img_metas,
+            rpn_loss_inputs = rpn_outs + (gt_bboxes, img_meta,
                                           self.train_cfg.rpn)
             rpn_losses = self.rpn_head.loss(
                 *rpn_loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
@@ -178,7 +188,7 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
 
             proposal_cfg = self.train_cfg.get('rpn_proposal',
                                               self.test_cfg.rpn)
-            proposal_inputs = rpn_outs + (img_metas, proposal_cfg)
+            proposal_inputs = rpn_outs + (img_meta, proposal_cfg)
             proposal_list = self.rpn_head.get_bboxes(*proposal_inputs)
         else:
             proposal_list = proposals
@@ -186,12 +196,13 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
         # assign gts and sample proposals
         if self.with_bbox or self.with_mask:
             bbox_assigner = build_assigner(self.train_cfg.rcnn.assigner)
-            bbox_sampler = build_sampler(
-                self.train_cfg.rcnn.sampler, context=self)
+            bbox_sampler = build_sampler(self.train_cfg.rcnn.sampler, context=self)
             num_imgs = img.size(0)
             if gt_bboxes_ignore is None:
                 gt_bboxes_ignore = [None for _ in range(num_imgs)]
             sampling_results = []
+            num_bgs = []
+            num_fgs = []
             for i in range(num_imgs):
                 assign_result = bbox_assigner.assign(proposal_list[i],
                                                      gt_bboxes[i],
@@ -204,6 +215,10 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
                     gt_labels[i],
                     feats=[lvl_feat[i][None] for lvl_feat in x])
                 sampling_results.append(sampling_result)
+                num_fgs.append(sampling_result.pos_inds.shape[0])
+                num_bgs.append(sampling_result.neg_inds.shape[0])
+            add_summary(prefix="sample_fast_rcnn_targets",
+                        num_fgs=np.mean(num_fgs), num_bgs=np.mean(num_bgs))
 
         # bbox head forward and loss
         if self.with_bbox:
@@ -266,7 +281,7 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
                                 proposals=None,
                                 rescale=False):
         """Async test without augmentation."""
-        assert self.with_bbox, 'Bbox head must be implemented.'
+        assert self.with_bbox, "Bbox head must be implemented."
         x = self.extract_feat(img)
 
         if proposals is None:
@@ -292,20 +307,20 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
                 mask_test_cfg=self.test_cfg.get('mask'))
             return bbox_results, segm_results
 
-    def simple_test(self, img, img_metas, proposals=None, rescale=False):
+    def simple_test(self, img, img_meta, proposals=None, rescale=False):
         """Test without augmentation."""
-        assert self.with_bbox, 'Bbox head must be implemented.'
+        assert self.with_bbox, "Bbox head must be implemented."
 
         x = self.extract_feat(img)
 
         if proposals is None:
-            proposal_list = self.simple_test_rpn(x, img_metas,
+            proposal_list = self.simple_test_rpn(x, img_meta,
                                                  self.test_cfg.rpn)
         else:
             proposal_list = proposals
 
         det_bboxes, det_labels = self.simple_test_bboxes(
-            x, img_metas, proposal_list, self.test_cfg.rcnn, rescale=rescale)
+            x, img_meta, proposal_list, self.test_cfg.rcnn, rescale=rescale)
         bbox_results = bbox2result(det_bboxes, det_labels,
                                    self.bbox_head.num_classes)
 
@@ -313,7 +328,7 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
             return bbox_results
         else:
             segm_results = self.simple_test_mask(
-                x, img_metas, det_bboxes, det_labels, rescale=rescale)
+                x, img_meta, det_bboxes, det_labels, rescale=rescale)
             return bbox_results, segm_results
 
     def aug_test(self, imgs, img_metas, rescale=False):
@@ -344,3 +359,24 @@ class TwoStageDetector(BaseDetector, RPNTestMixin, BBoxTestMixin,
             return bbox_results, segm_results
         else:
             return bbox_results
+
+    def research_test(self, img, img_meta, rescale=False):
+        x = self.extract_feat(img)
+
+        def imshow(imgs, win_name='name_', wait_time=10000):
+            if not isinstance(imgs, list):
+                imgs = [imgs]
+            for i, img in enumerate(imgs):
+                img = np.transpose(np.max(img.detach().cpu().numpy(), 1), (1, 2, 0))
+                img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_CUBIC)
+                cv2.imshow(win_name + str(i), img)
+            cv2.waitKey(wait_time)
+
+        imshow([x[0], img])
+
+    def dummy_forward(self, img, **kwargs):
+        x = self.extract_feat(img)
+        if self.with_rpn:
+            rpn_outs = self.rpn_head(x)
+            return rpn_outs
+        return x

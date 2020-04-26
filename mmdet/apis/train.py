@@ -1,16 +1,53 @@
+import logging
 import random
+import re
 from collections import OrderedDict
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import DistSamplerSeedHook, Runner
+from mmcv.runner import (DistSamplerSeedHook, get_dist_info,
+                         obj_from_dict)
 
-from mmdet.core import (DistEvalHook, DistOptimizerHook, EvalHook,
-                        Fp16OptimizerHook, build_optimizer)
-from mmdet.datasets import build_dataloader, build_dataset
-from mmdet.utils import get_root_logger
+from mmdet import datasets
+from mmdet.core import (CocoDistEvalmAPHook, CocoDistEvalRecallHook,
+                        DistEvalmAPHook, DistOptimizerHook, Fp16OptimizerHook,
+                        DistSearchOptimizerHook, BackboneHistHook, NeckHistHook,
+                        BBoxHeadHistHook, SearchHook)
+from mmdet.datasets import DATASETS, build_dataloader
+from mmdet.models import RPN
+from mmdet.core.utils.tensorboard_hook import TensorboardHook
+from mmdet.core.utils.checkpoint_hook import CheckpointHook
+from mmdet.core.utils.text import TextLoggerHook
+from mmdet.apis.runner import Runner
+
+
+def get_root_logger(logger=None, log_file=None, log_level=logging.INFO, mmdet_mode=False):
+    if mmdet_mode:
+        logger = logging.getLogger('mmdet')
+        # if the logger has been initialized, just return it
+        if logger.hasHandlers():
+            return logger
+
+        logging.basicConfig(
+            format='%(asctime)s - %(levelname)s - %(message)s', level=log_level)
+        rank, _ = get_dist_info()
+        if rank != 0:
+            logger.setLevel('ERROR')
+        elif log_file is not None:
+            file_handler = logging.FileHandler(log_file, 'w')
+            file_handler.setFormatter(
+                logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            file_handler.setLevel(log_level)
+            logger.addHandler(file_handler)
+    else:
+        if logger is None:
+            logger = logging.getLogger()
+        rank, _ = get_dist_info()
+        if rank != 0:
+            logger.setLevel('ERROR')
+    return logger
 
 
 def set_random_seed(seed, deterministic=False):
@@ -86,10 +123,232 @@ def train_detector(model,
                    cfg,
                    distributed=False,
                    validate=False,
+                   logger=None,
                    timestamp=None,
-                   meta=None):
-    logger = get_root_logger(cfg.log_level)
+                   runner_attr_dict=dict()):
+    logger = get_root_logger(logger=logger, log_level=cfg.log_level)
 
+    # start training
+    if distributed:
+        _dist_train(
+            model,
+            dataset,
+            cfg,
+            validate=validate,
+            logger=logger,
+            timestamp=timestamp,
+            runner_attr_dict=runner_attr_dict)
+    else:
+        _non_dist_train(
+            model,
+            dataset,
+            cfg,
+            validate=validate,
+            logger=logger,
+            timestamp=timestamp,
+            runner_attr_dict=runner_attr_dict)
+
+
+def build_optimizer(model, optimizer_cfg):
+    """Build optimizer from configs.
+
+    Args:
+        model (:obj:`nn.Module`): The model with parameters to be optimized.
+        optimizer_cfg (dict): The config dict of the optimizer.
+            Positional fields are:
+                - type: class name of the optimizer.
+                - lr: base learning rate.
+            Optional fields are:
+                - any arguments of the corresponding optimizer type, e.g.,
+                  weight_decay, momentum, etc.
+                - paramwise_options: a dict with 3 accepted fileds
+                  (bias_lr_mult, bias_decay_mult, norm_decay_mult).
+                  `bias_lr_mult` and `bias_decay_mult` will be multiplied to
+                  the lr and weight decay respectively for all bias parameters
+                  (except for the normalization layers), and
+                  `norm_decay_mult` will be multiplied to the weight decay
+                  for all weight and bias parameters of normalization layers.
+
+    Returns:
+        torch.optim.Optimizer: The initialized optimizer.
+
+    Example:
+        >>> model = torch.nn.modules.Conv1d(1, 1, 1)
+        >>> optimizer_cfg = dict(type='SGD', lr=0.01, momentum=0.9,
+        >>>                      weight_decay=0.0001)
+        >>> optimizer = build_optimizer(model, optimizer_cfg)
+    """
+    if hasattr(model, 'module'):
+        model = model.module
+
+    optimizer_cfg = optimizer_cfg.copy()
+    paramwise_options = optimizer_cfg.pop('paramwise_options', None)
+    # if no paramwise option is specified, just use the global setting
+    if paramwise_options is None:
+        return obj_from_dict(optimizer_cfg, torch.optim,
+                             dict(params=model.parameters()))
+    else:
+        assert isinstance(paramwise_options, dict)
+        # get base lr and weight decay
+        base_lr = optimizer_cfg['lr']
+        base_wd = optimizer_cfg.get('weight_decay', None)
+        base_mom = optimizer_cfg.get('momentum', None)
+        # weight_decay must be explicitly specified if mult is specified
+        if ('bias_decay_mult' in paramwise_options
+                or 'norm_decay_mult' in paramwise_options):
+            assert base_wd is not None
+        # get param-wise options
+        bias_lr_mult = paramwise_options.get('bias_lr_mult', 1.)
+        arch_lr_mult = paramwise_options.get('arch_lr_mult', 1.)
+        bias_decay_mult = paramwise_options.get('bias_decay_mult', 1.)
+        norm_decay_mult = paramwise_options.get('norm_decay_mult', 1.)
+        arch_decay_mult = paramwise_options.get('arch_decay_mult', 1.)
+        arch_mom_mult = paramwise_options.get('arch_mom_mult', 1.)
+        # set param-wise lr and weight decay
+        params = []
+        for name, param in model.named_parameters():
+            param_group = {'params': [param]}
+            if not param.requires_grad:
+                # FP16 training needs to copy gradient/weight between master
+                # weight copy and model weight, it is convenient to keep all
+                # parameters here to align with model.parameters()
+                params.append(param_group)
+                continue
+
+            # for norm layers, overwrite the weight decay of weight and bias
+            # TODO: obtain the norm layer prefixes dynamically
+            if re.search(r'(bn|gn)(\d+)?.(weight|bias)', name):
+                if base_wd is not None:
+                    param_group['weight_decay'] = base_wd * norm_decay_mult
+            # for other layers, overwrite both lr and weight decay of bias
+            elif name.endswith('.bias'):
+                param_group['lr'] = base_lr * bias_lr_mult
+                if base_wd is not None:
+                    param_group['weight_decay'] = base_wd * bias_decay_mult
+            elif name.endswith('_raw'):
+                param_group['lr'] = base_lr * arch_lr_mult
+                if base_wd is not None:
+                    param_group['weight_decay'] = base_wd * arch_decay_mult
+                if base_mom is not None:
+                    param_group['momentum'] = base_mom * arch_mom_mult
+            # otherwise use the global settings
+
+            params.append(param_group)
+
+        optimizer_cls = getattr(torch.optim, optimizer_cfg.pop('type'))
+        return optimizer_cls(params, **optimizer_cfg)
+
+
+def register_hooks(runner, cfg):
+    if hasattr(cfg, 'log_config'):
+        runner.register_hook(TensorboardHook(cfg.log_config.interval))
+        runner.register_hook(TextLoggerHook(cfg.log_config.interval), priority='VERY_LOW')
+
+    if hasattr(cfg, 'checkpoint_config'):
+        runner.register_hook(CheckpointHook(
+            getattr(cfg.checkpoint_config, 'save_every_n_steps', 200),
+            getattr(cfg.checkpoint_config, 'max_to_keep', 2),
+            getattr(cfg.checkpoint_config, 'keep_every_n_epochs', 40),
+            getattr(cfg.checkpoint_config, 'keep_in_n_epoch', []),), priority='HIGHEST')
+
+    if hasattr(cfg, 'backbone_hist_config'):
+        runner.register_hook(BackboneHistHook(
+            cfg.backbone_hist_config.model_type,
+            cfg.backbone_hist_config.save_every_n_steps,
+            getattr(cfg.backbone_hist_config, 'sub_modules', ['backbone'])), priority='VERY_LOW')
+
+    if hasattr(cfg, 'neck_hist_config'):
+        runner.register_hook(NeckHistHook(
+            cfg.neck_hist_config.model_type,
+            cfg.neck_hist_config.save_every_n_steps,
+            getattr(cfg.neck_hist_config, 'sub_modules', ['neck'])), priority='VERY_LOW')
+
+    if hasattr(cfg, 'bbox_head_hist_config'):
+        runner.register_hook(BBoxHeadHistHook(
+            cfg.bbox_head_hist_config.model_type,
+            cfg.bbox_head_hist_config.save_every_n_steps,
+            getattr(cfg.bbox_head_hist_config, 'sub_modules', ['bbox_head'])), priority='VERY_LOW')
+
+
+def _dist_train(model,
+                dataset,
+                cfg,
+                validate=False,
+                logger=None,
+                timestamp=None,
+                runner_attr_dict=dict()):
+    # prepare data loaders
+    dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
+    data_loaders = [
+        build_dataloader(
+            ds, cfg.data.imgs_per_gpu, cfg.data.workers_per_gpu, dist=True)
+        for ds in dataset
+    ]
+    # build runner
+    runner_attr_dict.update({'imgs_per_gpu': cfg.data.imgs_per_gpu,
+                             'initial_lr': cfg.optimizer['lr']})
+    if hasattr(dataset, 'CLASSES'):
+        runner_attr_dict.update({'classes': dataset.CLASSES})
+    optimizer = build_optimizer(model, cfg.optimizer)
+    search_optimizer = getattr(cfg, 'search_config', {}).pop('search_optimizer', None)
+    runner = Runner(
+        model, batch_processor, optimizer, search_optimizer, cfg.work_dir,
+        logger=logger, runner_attr_dict=runner_attr_dict)
+    # an ugly walkaround to make the .log and .log.json filenames the same
+    runner.timestamp = timestamp
+
+    # fp16 setting
+    fp16_cfg = cfg.get('fp16', None)
+    if fp16_cfg is not None:
+        optimizer_config = Fp16OptimizerHook(**cfg.optimizer_config,
+                                             **fp16_cfg)
+    else:
+        optimizer_config = DistOptimizerHook(**cfg.optimizer_config)
+
+    # register hooks
+    runner.register_training_hooks(cfg.lr_config, optimizer_config)
+    runner.register_hook(DistSamplerSeedHook())
+    if search_optimizer is not None:
+        runner.register_hook(DistSearchOptimizerHook())
+        runner.register_hook(SearchHook(**cfg.search_config))
+    # register eval hooks
+    if validate:
+        val_dataset_cfg = cfg.data.val
+        eval_cfg = cfg.get('evaluation', {})
+        if isinstance(model.module, RPN):
+            # TODO: implement recall hooks for other datasets
+            runner.register_hook(
+                CocoDistEvalRecallHook(val_dataset_cfg, **eval_cfg))
+        else:
+            dataset_type = DATASETS.get(val_dataset_cfg.type)
+            if issubclass(dataset_type, datasets.CocoDataset):
+                runner.register_hook(
+                    CocoDistEvalmAPHook(val_dataset_cfg, **eval_cfg))
+            else:
+                runner.register_hook(
+                    DistEvalmAPHook(val_dataset_cfg, **eval_cfg))
+
+    register_hooks(runner, cfg)
+
+    if cfg.resume_from:
+        runner.resume(cfg.resume_from)
+    elif cfg.load_from:
+        runner.load_checkpoint(cfg.load_from)
+    runner.run(data_loaders, cfg.workflow, cfg.total_epochs)
+
+
+def _non_dist_train(model,
+                    dataset,
+                    cfg,
+                    validate=False,
+                    logger=None,
+                    timestamp=None,
+                    runner_attr_dict=dict()):
+    if validate:
+        raise NotImplementedError('Built-in validation is not implemented '
+                                  'yet in not-distributed training. Use '
+                                  'distributed training or test.py and '
+                                  '*eval.py scripts instead.')
     # prepare data loaders
     dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
     data_loaders = [
@@ -97,66 +356,41 @@ def train_detector(model,
             ds,
             cfg.data.imgs_per_gpu,
             cfg.data.workers_per_gpu,
-            # cfg.gpus will be ignored if distributed
-            len(cfg.gpu_ids),
-            dist=distributed,
-            seed=cfg.seed) for ds in dataset
+            cfg.gpus,
+            dist=False) for ds in dataset
     ]
-
-    # put model on gpus
-    if distributed:
-        find_unused_parameters = cfg.get('find_unused_parameters', False)
-        # Sets the `find_unused_parameters` parameter in
-        # torch.nn.parallel.DistributedDataParallel
-        model = MMDistributedDataParallel(
-            model.cuda(),
-            device_ids=[torch.cuda.current_device()],
-            broadcast_buffers=False,
-            find_unused_parameters=find_unused_parameters)
-    else:
-        model = MMDataParallel(
-            model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
-
     # build runner
+    runner_attr_dict.update({'imgs_per_gpu': cfg.data.imgs_per_gpu,
+                             'initial_lr': cfg.optimizer['lr']})
+    if hasattr(dataset, 'CLASSES'):
+        runner_attr_dict.update({'classes': dataset.CLASSES})
     optimizer = build_optimizer(model, cfg.optimizer)
+    search_optimizer = getattr(getattr(cfg, 'search_config', {}), 'search_optimizer', None)
+    assert search_optimizer is None, "Not support"
     runner = Runner(
-        model,
-        batch_processor,
-        optimizer,
-        cfg.work_dir,
-        logger=logger,
-        meta=meta)
+        model, batch_processor, optimizer, search_optimizer, cfg.work_dir,
+        logger=logger, runner_attr_dict=runner_attr_dict)
     # an ugly walkaround to make the .log and .log.json filenames the same
     runner.timestamp = timestamp
-
     # fp16 setting
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
         optimizer_config = Fp16OptimizerHook(
-            **cfg.optimizer_config, **fp16_cfg, distributed=distributed)
-    elif distributed:
-        optimizer_config = DistOptimizerHook(**cfg.optimizer_config)
+            **cfg.optimizer_config, **fp16_cfg, distributed=False)
     else:
         optimizer_config = cfg.optimizer_config
-
-    # register hooks
-    runner.register_training_hooks(cfg.lr_config, optimizer_config,
-                                   cfg.checkpoint_config, cfg.log_config)
-    if distributed:
-        runner.register_hook(DistSamplerSeedHook())
-
+    runner.register_training_hooks(cfg.lr_config, optimizer_config)
     # register eval hooks
     if validate:
-        val_dataset = build_dataset(cfg.data.val, dict(test_mode=True))
-        val_dataloader = build_dataloader(
-            val_dataset,
-            imgs_per_gpu=1,
-            workers_per_gpu=cfg.data.workers_per_gpu,
-            dist=distributed,
-            shuffle=False)
-        eval_cfg = cfg.get('evaluation', {})
-        eval_hook = DistEvalHook if distributed else EvalHook
-        runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
+        if isinstance(model.module, RPN):
+            runner.register_hook(CocoDistEvalRecallHook(cfg.data.val))
+        else:
+            if cfg.data.val.type == 'CocoDataset':
+                runner.register_hook(CocoDistEvalmAPHook(cfg.data.val))
+            else:
+                runner.register_hook(DistEvalmAPHook(cfg.data.val))
+
+    register_hooks(runner, cfg)
 
     if cfg.resume_from:
         runner.resume(cfg.resume_from)

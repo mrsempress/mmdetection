@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from mmcv.cnn import VGG, constant_init, kaiming_init, normal_init, xavier_init
 from mmcv.runner import load_checkpoint
 
-from mmdet.utils import get_root_logger
 from ..registry import BACKBONES
 
 
@@ -74,6 +73,7 @@ class SSDVGG(VGG):
 
     def init_weights(self, pretrained=None):
         if isinstance(pretrained, str):
+            from mmdet.apis import get_root_logger
             logger = get_root_logger()
             load_checkpoint(self, pretrained, strict=False, logger=logger)
         elif pretrained is None:
@@ -94,6 +94,17 @@ class SSDVGG(VGG):
         constant_init(self.l2_norm, self.l2_norm.scale)
 
     def forward(self, x):
+        """
+        | SSD500 | VGG16   | Extra_layer | Total   |
+        | ------ | ------- | ----------- | ------- |
+        | Time   | 10.25ms | 2.97ms      | 13.18ms |
+
+        Args:
+            x: image tensor.
+
+        Returns:
+
+        """
         outs = []
         for i, layer in enumerate(self.features):
             x = layer(x)

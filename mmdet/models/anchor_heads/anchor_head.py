@@ -89,13 +89,16 @@ class AnchorHead(nn.Module):
         normal_init(self.conv_cls, std=0.01)
         normal_init(self.conv_reg, std=0.01)
 
-    def forward_single(self, x):
+    def forward_single_level(self, x, idx):
         cls_score = self.conv_cls(x)
         bbox_pred = self.conv_reg(x)
         return cls_score, bbox_pred
 
     def forward(self, feats):
-        return multi_apply(self.forward_single, feats)
+        if isinstance(feats, tuple) and isinstance(feats[0], tuple):
+            # used in RetinaNet with n_list.
+            feats = tuple(zip(*feats))
+        return multi_apply(self.forward_single_level, feats, range(len(feats)))
 
     def get_anchors(self, featmap_sizes, img_metas, device='cuda'):
         """Get anchors according to feature map sizes.
@@ -138,8 +141,8 @@ class AnchorHead(nn.Module):
 
         return anchor_list, valid_flag_list
 
-    def loss_single(self, cls_score, bbox_pred, labels, label_weights,
-                    bbox_targets, bbox_weights, num_total_samples, cfg):
+    def loss_single_level(self, cls_score, bbox_pred, labels, label_weights,
+                          bbox_targets, bbox_weights, num_total_samples, cfg):
         # classification loss
         labels = labels.reshape(-1)
         label_weights = label_weights.reshape(-1)
@@ -188,13 +191,14 @@ class AnchorHead(nn.Module):
             label_channels=label_channels,
             sampling=self.sampling)
         if cls_reg_targets is None:
-            return None
+            return dict(loss_cls=0, loss_reg=0)
+        # each tensor in the list is corresponding to a level.
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
         num_total_samples = (
             num_total_pos + num_total_neg if self.sampling else num_total_pos)
         losses_cls, losses_bbox = multi_apply(
-            self.loss_single,
+            self.loss_single_level,
             cls_scores,
             bbox_preds,
             labels_list,
@@ -203,7 +207,9 @@ class AnchorHead(nn.Module):
             bbox_weights_list,
             num_total_samples=num_total_samples,
             cfg=cfg)
-        return dict(loss_cls=losses_cls, loss_bbox=losses_bbox)
+        # each tensor in losses_cls and losses_reg is corresponding to a level.
+        return {'losses/loss_cls': losses_cls,
+                'losses/loss_bbox': losses_bbox}
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
     def get_bboxes(self,
@@ -255,6 +261,8 @@ class AnchorHead(nn.Module):
         num_levels = len(cls_scores)
 
         device = cls_scores[0].device
+        # Retina-R50: 2.45ms for all levels (5).
+        # SSD500: 3.98ms for all levels (7).
         mlvl_anchors = [
             self.anchor_generators[i].grid_anchors(
                 cls_scores[i].size()[-2:],
@@ -271,22 +279,40 @@ class AnchorHead(nn.Module):
             ]
             img_shape = img_metas[img_id]['img_shape']
             scale_factor = img_metas[img_id]['scale_factor']
-            proposals = self.get_bboxes_single(cls_score_list, bbox_pred_list,
-                                               mlvl_anchors, img_shape,
-                                               scale_factor, cfg, rescale)
+            proposals = self.get_bboxes_single_image(cls_score_list, bbox_pred_list,
+                                                     mlvl_anchors, img_shape,
+                                                     scale_factor, cfg, rescale)
             result_list.append(proposals)
         return result_list
 
-    def get_bboxes_single(self,
-                          cls_score_list,
-                          bbox_pred_list,
-                          mlvl_anchors,
-                          img_shape,
-                          scale_factor,
-                          cfg,
-                          rescale=False):
+    def get_bboxes_single_image(self,
+                                cls_score_list,
+                                bbox_pred_list,
+                                mlvl_anchors,
+                                img_shape,
+                                scale_factor,
+                                cfg,
+                                rescale=False):
         """
         Transform outputs for a single batch item into labeled boxes.
+        | Retina-R50 | P3     | P4     | P5     | P6     | P7   | Total  |
+        | ---------- | ------ | ------ | ------ | ------ | ---- | ------ |
+        | pre-nms    | 3.12ms | 1.92ms | 1.92ms | 1.82ms | NA   | 10.2ms |
+        | nms        | NA     | NA     | NA     | NA     | NA   | 11.0ms |
+
+        | SSD500  | Total  |
+        | ------- | ------ |
+        | pre-nms | 14.2ms |
+        | nms     | 25.4ms |
+        Args:
+            cls_scores: list(tensor), tensor <=> image.
+            bbox_preds: list(tensor), tensor <=> image.
+            mlvl_anchors: list(tensor), tensor <=> image.
+            img_shape:
+            scale_factor:
+            cfg:
+            rescale:
+
         """
         assert len(cls_score_list) == len(bbox_pred_list) == len(mlvl_anchors)
         mlvl_bboxes = []

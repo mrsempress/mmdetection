@@ -1,13 +1,16 @@
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 from mmcv.cnn import constant_init, kaiming_init
 from mmcv.runner import load_checkpoint
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from mmdet.ops import (ContextBlock, GeneralizedAttention, build_conv_layer,
-                       build_norm_layer)
-from mmdet.utils import get_root_logger
+from mmdet.models.plugins import GeneralizedAttention
+from mmdet.ops import ContextBlock
+from mmdet.core.utils.summary import add_histogram_summary, every_n_local_step
 from ..registry import BACKBONES
+from ..utils import build_conv_layer, build_norm_layer, CBAMBlock, MaskModule, SEBlock
 
 
 class BasicBlock(nn.Module):
@@ -23,13 +26,20 @@ class BasicBlock(nn.Module):
                  with_cp=False,
                  conv_cfg=None,
                  norm_cfg=dict(type='BN'),
+                 bias=False,
+                 use_spatial_attention=False,
+                 use_se_block=False,
                  dcn=None,
                  gcb=None,
                  gen_attention=None):
         super(BasicBlock, self).__init__()
-        assert dcn is None, 'Not implemented yet.'
-        assert gen_attention is None, 'Not implemented yet.'
-        assert gcb is None, 'Not implemented yet.'
+        assert gen_attention is None, "Not implemented yet."
+        assert gcb is None, "Not implemented yet."
+
+        self.dcn = dcn
+        self.with_dcn = dcn is not None
+        self.use_spatial_attention = use_spatial_attention
+        self.use_se_block = use_se_block
 
         self.norm1_name, norm1 = build_norm_layer(norm_cfg, planes, postfix=1)
         self.norm2_name, norm2 = build_norm_layer(norm_cfg, planes, postfix=2)
@@ -42,11 +52,31 @@ class BasicBlock(nn.Module):
             stride=stride,
             padding=dilation,
             dilation=dilation,
-            bias=False)
+            bias=bias)
         self.add_module(self.norm1_name, norm1)
-        self.conv2 = build_conv_layer(
-            conv_cfg, planes, planes, 3, padding=1, bias=False)
+
+        fallback_on_stride = False
+        if self.with_dcn:
+            fallback_on_stride = dcn.pop('fallback_on_stride', False)
+        if not self.with_dcn or fallback_on_stride:
+            self.conv2 = build_conv_layer(
+                conv_cfg, planes, planes, 3, padding=1, bias=bias)
+        else:
+            assert self.conv_cfg is None, 'conv_cfg cannot be None for DCN'
+            self.conv2 = build_conv_layer(
+                dcn,
+                planes,
+                planes,
+                kernel_size=3,
+                stride=self.conv2_stride,
+                padding=dilation,
+                dilation=dilation,
+                bias=False)
+
         self.add_module(self.norm2_name, norm2)
+
+        if use_se_block:
+            self.se_block = SEBlock(planes)
 
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
@@ -69,13 +99,140 @@ class BasicBlock(nn.Module):
         out = self.norm1(out)
         out = self.relu(out)
 
-        out = self.conv2(out)
+        if not self.with_dcn:
+            out = self.conv2(out)
+        else:
+            if self.use_spatial_attention:
+                out = self.spatial_attention(out)
+
+            if self.with_modulated_dcn:
+                offset_mask = self.conv2_offset(out)
+                offset = offset_mask[:, :18, :, :]
+                mask = offset_mask[:, -9:, :, :].sigmoid()
+                out = self.conv2(out, offset, mask)
+            else:
+                offset = self.conv2_offset(out)
+                out = self.conv2(out, offset)
         out = self.norm2(out)
+
+        if self.use_se_block:
+            out = self.se_block(out) * out
 
         if self.downsample is not None:
             identity = self.downsample(x)
 
         out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class TridentBasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self,
+                 inplanes,
+                 planes,
+                 stride=1,
+                 dilation=1,
+                 downsample=None,
+                 style='pytorch',
+                 with_cp=False,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN'),
+                 bias=False,
+                 use_spatial_attention=False,
+                 use_se_block=False,
+                 dcn=None,
+                 gcb=None,
+                 gen_attention=None):
+        super(TridentBasicBlock, self).__init__()
+        assert gen_attention is None, "Not implemented yet."
+        assert gcb is None, "Not implemented yet."
+        assert dcn is None, "Not implemented yet."
+        assert use_spatial_attention is False, "Not implemented yet."
+        assert use_se_block is False, "Not implemented yet."
+        assert downsample is None, "Not implemented yet."
+        assert not with_cp
+
+        assert inplanes % 4 == planes % 4 == 0, \
+            "Not support inplanes: {}, planes: {}".format(inplanes, planes)
+        assert stride == 1 and dilation == 1
+
+        self.norm1_1_name, norm1_1 = build_norm_layer(norm_cfg, planes // 2, postfix='1_1')
+        self.norm1_2_name, norm1_2 = build_norm_layer(norm_cfg, planes // 4, postfix='1_2')
+        self.norm1_3_name, norm1_3 = build_norm_layer(norm_cfg, planes // 4, postfix='1_3')
+        self.norm2_name, norm2 = build_norm_layer(norm_cfg, planes, postfix=2)
+
+        self.conv1_1 = build_conv_layer(
+            conv_cfg,
+            inplanes,
+            planes // 2,
+            3,
+            stride=1,
+            padding=1,
+            dilation=1,
+            bias=bias)
+        self.add_module(self.norm1_1_name, norm1_1)
+
+        self.conv1_2 = build_conv_layer(
+            conv_cfg,
+            inplanes,
+            planes // 4,
+            3,
+            stride=1,
+            padding=2,
+            dilation=2,
+            bias=bias)
+        self.add_module(self.norm1_2_name, norm1_2)
+
+        self.conv1_3 = build_conv_layer(
+            conv_cfg,
+            inplanes,
+            planes // 4,
+            3,
+            stride=1,
+            padding=3,
+            dilation=3,
+            bias=bias)
+        self.add_module(self.norm1_3_name, norm1_3)
+
+        self.conv2 = build_conv_layer(
+            conv_cfg, planes, planes, 3, padding=1, bias=bias)
+        self.add_module(self.norm2_name, norm2)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    @property
+    def norm1_1(self):
+        return getattr(self, self.norm1_1_name)
+
+    @property
+    def norm1_2(self):
+        return getattr(self, self.norm1_2_name)
+
+    @property
+    def norm1_3(self):
+        return getattr(self, self.norm1_3_name)
+
+    @property
+    def norm2(self):
+        return getattr(self, self.norm2_name)
+
+    def forward(self, x):
+        out1 = self.conv1_1(x)
+        out1 = self.norm1_1(out1)
+        out2 = self.conv1_2(x)
+        out2 = self.norm1_2(out2)
+        out3 = self.conv1_3(x)
+        out3 = self.norm1_3(out3)
+
+        out = torch.cat([out1, out2, out3], dim=1)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.norm2(out)
+
         out = self.relu(out)
 
         return out
@@ -94,6 +251,9 @@ class Bottleneck(nn.Module):
                  with_cp=False,
                  conv_cfg=None,
                  norm_cfg=dict(type='BN'),
+                 bias=False,
+                 use_spatial_attention=False,
+                 use_se_block=False,
                  dcn=None,
                  gcb=None,
                  gen_attention=None):
@@ -122,6 +282,9 @@ class Bottleneck(nn.Module):
         self.gen_attention = gen_attention
         self.with_gen_attention = gen_attention is not None
 
+        assert not use_spatial_attention, NotImplementedError
+        self.use_se_block = use_se_block
+
         if self.style == 'pytorch':
             self.conv1_stride = 1
             self.conv2_stride = stride
@@ -140,7 +303,7 @@ class Bottleneck(nn.Module):
             planes,
             kernel_size=1,
             stride=self.conv1_stride,
-            bias=False)
+            bias=bias)
         self.add_module(self.norm1_name, norm1)
         fallback_on_stride = False
         if self.with_dcn:
@@ -173,8 +336,11 @@ class Bottleneck(nn.Module):
             planes,
             planes * self.expansion,
             kernel_size=1,
-            bias=False)
+            bias=bias)
         self.add_module(self.norm3_name, norm3)
+
+        if use_se_block:
+            self.se_block = SEBlock(planes * self.expansion)
 
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
@@ -222,6 +388,9 @@ class Bottleneck(nn.Module):
             if self.with_gcb:
                 out = self.context_block(out)
 
+            if self.use_se_block:
+                out = self.se_block(out) * out
+
             if self.downsample is not None:
                 identity = self.downsample(x)
 
@@ -249,22 +418,30 @@ def make_res_layer(block,
                    with_cp=False,
                    conv_cfg=None,
                    norm_cfg=dict(type='BN'),
+                   bias=False,
+                   use_spatial_attention=False,
+                   use_se_block=False,
+                   use_trident_c4=False,
+                   use_trident_c5=False,
                    dcn=None,
                    gcb=None,
                    gen_attention=None,
                    gen_attention_blocks=[]):
     downsample = None
     if stride != 1 or inplanes != planes * block.expansion:
-        downsample = nn.Sequential(
+        downsample = [
             build_conv_layer(
                 conv_cfg,
                 inplanes,
                 planes * block.expansion,
                 kernel_size=1,
                 stride=stride,
-                bias=False),
-            build_norm_layer(norm_cfg, planes * block.expansion)[1],
-        )
+                bias=bias),
+            build_norm_layer(norm_cfg, planes * block.expansion)[1]]
+        if use_se_block:
+            downsample.append(SEBlock(planes * block.expansion))
+
+        downsample = nn.Sequential(*downsample)
 
     layers = []
     layers.append(
@@ -278,12 +455,17 @@ def make_res_layer(block,
             with_cp=with_cp,
             conv_cfg=conv_cfg,
             norm_cfg=norm_cfg,
+            bias=bias,
+            use_spatial_attention=use_spatial_attention,
+            use_se_block=use_se_block,
             dcn=dcn,
             gcb=gcb,
             gen_attention=gen_attention if
             (0 in gen_attention_blocks) else None))
     inplanes = planes * block.expansion
     for i in range(1, blocks):
+        if i == blocks - 1 and (use_trident_c4 or use_trident_c5):
+            block = TridentBasicBlock
         layers.append(
             block(
                 inplanes=inplanes,
@@ -294,6 +476,9 @@ def make_res_layer(block,
                 with_cp=with_cp,
                 conv_cfg=conv_cfg,
                 norm_cfg=norm_cfg,
+                bias=bias,
+                use_spatial_attention=use_spatial_attention,
+                use_se_block=use_se_block,
                 dcn=dcn,
                 gcb=gcb,
                 gen_attention=gen_attention if
@@ -360,10 +545,22 @@ class ResNet(nn.Module):
                  style='pytorch',
                  frozen_stages=-1,
                  conv_cfg=None,
+                 local_conv_cfg=None,
                  norm_cfg=dict(type='BN', requires_grad=True),
                  norm_eval=True,
+                 bias=False,
+                 reset_running_stats=False,
                  dcn=None,
                  stage_with_dcn=(False, False, False, False),
+                 stage_with_local_conv_cfg=(False, False, False, False),
+                 stage_with_se=(False, False, False, False),
+                 use_spatial_attention=False,
+                 attention_mask_layer_n=None,
+                 use_trident_c4=False,
+                 use_trident_c5=False,
+                 add_summay_every_n_step=None,
+                 return_fc=False,
+                 num_classes=1000,
                  gcb=None,
                  stage_with_gcb=(False, False, False, False),
                  gen_attention=None,
@@ -375,7 +572,7 @@ class ResNet(nn.Module):
             raise KeyError('invalid depth {} for resnet'.format(depth))
         self.depth = depth
         self.num_stages = num_stages
-        assert num_stages >= 1 and num_stages <= 4
+        assert 4 >= num_stages >= 1
         self.strides = strides
         self.dilations = dilations
         assert len(strides) == len(dilations) == num_stages
@@ -387,6 +584,8 @@ class ResNet(nn.Module):
         self.norm_cfg = norm_cfg
         self.with_cp = with_cp
         self.norm_eval = norm_eval
+        self.bias = bias
+        self.reset_running_stats = reset_running_stats
         self.dcn = dcn
         self.stage_with_dcn = stage_with_dcn
         if dcn is not None:
@@ -396,6 +595,13 @@ class ResNet(nn.Module):
         self.stage_with_gcb = stage_with_gcb
         if gcb is not None:
             assert len(stage_with_gcb) == num_stages
+        if local_conv_cfg is not None:
+            assert len(stage_with_local_conv_cfg) == num_stages
+        assert attention_mask_layer_n is None or 1 <= attention_mask_layer_n <= 4
+        self.attention_mask_layer_n = attention_mask_layer_n
+        assert not (use_trident_c4 and use_trident_c5)
+        self.add_summay_every_n_step = add_summay_every_n_step
+        self.return_fc = return_fc
         self.zero_init_residual = zero_init_residual
         self.block, stage_blocks = self.arch_settings[depth]
         self.stage_blocks = stage_blocks[:num_stages]
@@ -409,7 +615,9 @@ class ResNet(nn.Module):
             dilation = dilations[i]
             dcn = self.dcn if self.stage_with_dcn[i] else None
             gcb = self.gcb if self.stage_with_gcb[i] else None
-            planes = 64 * 2**i
+            planes = 64 * 2 ** i
+            conv_cfg = self.conv_cfg if not stage_with_local_conv_cfg[i] else local_conv_cfg
+            with_se = stage_with_se[i]
             res_layer = make_res_layer(
                 self.block,
                 self.inplanes,
@@ -421,6 +629,11 @@ class ResNet(nn.Module):
                 with_cp=with_cp,
                 conv_cfg=conv_cfg,
                 norm_cfg=norm_cfg,
+                bias=bias,
+                use_spatial_attention=use_spatial_attention,
+                use_se_block=with_se,
+                use_trident_c4=use_trident_c4 if i == 2 else False,
+                use_trident_c5=use_trident_c5 if i == 3 else False,
                 dcn=dcn,
                 gcb=gcb,
                 gen_attention=gen_attention,
@@ -430,10 +643,21 @@ class ResNet(nn.Module):
             self.add_module(layer_name, res_layer)
             self.res_layers.append(layer_name)
 
+        if return_fc:
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(512 * self.block.expansion, num_classes)
+
         self._freeze_stages()
 
-        self.feat_dim = self.block.expansion * 64 * 2**(
-            len(self.stage_blocks) - 1)
+        self.feat_dim = self.block.expansion * 64 * 2 ** (len(self.stage_blocks) - 1)
+
+        if attention_mask_layer_n:
+            mask_stride = 4
+            for i in range(attention_mask_layer_n):
+                mask_stride *= strides[i]
+            self.attention_mask = MaskModule(
+                int(64 * 2 ** (attention_mask_layer_n - 1) * self.block.expansion),
+                feat_stride=mask_stride)
 
     @property
     def norm1(self):
@@ -447,7 +671,7 @@ class ResNet(nn.Module):
             kernel_size=7,
             stride=2,
             padding=3,
-            bias=False)
+            bias=self.bias)
         self.norm1_name, norm1 = build_norm_layer(self.norm_cfg, 64, postfix=1)
         self.add_module(self.norm1_name, norm1)
         self.relu = nn.ReLU(inplace=True)
@@ -468,6 +692,7 @@ class ResNet(nn.Module):
 
     def init_weights(self, pretrained=None):
         if isinstance(pretrained, str):
+            from mmdet.apis import get_root_logger
             logger = get_root_logger()
             load_checkpoint(self, pretrained, strict=False, logger=logger)
         elif pretrained is None:
@@ -475,13 +700,15 @@ class ResNet(nn.Module):
                 if isinstance(m, nn.Conv2d):
                     kaiming_init(m)
                 elif isinstance(m, (_BatchNorm, nn.GroupNorm)):
-                    constant_init(m, 1)
+                    try:
+                        constant_init(m, 1)
+                    except:
+                        pass
 
             if self.dcn is not None:
                 for m in self.modules():
-                    if isinstance(m, Bottleneck) and hasattr(
-                            m.conv2, 'conv_offset'):
-                        constant_init(m.conv2.conv_offset, 0)
+                    if isinstance(m, (BasicBlock, Bottleneck)) and hasattr(m, 'conv2_offset'):
+                        constant_init(m.conv2_offset, 0)
 
             if self.zero_init_residual:
                 for m in self.modules():
@@ -493,23 +720,42 @@ class ResNet(nn.Module):
             raise TypeError('pretrained must be a str or None')
 
     def forward(self, x):
+        # R50: 22.5ms
         x = self.conv1(x)
         x = self.norm1(x)
         x = self.relu(x)
         x = self.maxpool(x)
         outs = []
+        mask = None
         for i, layer_name in enumerate(self.res_layers):
+            if self.attention_mask_layer_n and self.attention_mask_layer_n == i:
+                x, mask = self.attention_mask(x)
             res_layer = getattr(self, layer_name)
             x = res_layer(x)
             if i in self.out_indices:
                 outs.append(x)
+
+            if self.add_summay_every_n_step and every_n_local_step(self.add_summay_every_n_step):
+                add_histogram_summary('resnet_feat_layer{}'.format(i + 1), x.detach().cpu())
+                add_histogram_summary('resnet_weight_layer{}'.format(i + 1),
+                                      res_layer[-1].conv2.weight.detach().cpu(), is_param=True)
+
+        if self.attention_mask_layer_n:
+            return tuple(outs), mask
+
+        if self.return_fc:
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            x = self.fc(x)
+            return x
+
         return tuple(outs)
 
     def train(self, mode=True):
         super(ResNet, self).train(mode)
         self._freeze_stages()
         if mode and self.norm_eval:
-            for m in self.modules():
+            for _, m in self.named_modules():
                 # trick: eval have effect on BatchNorm only
                 if isinstance(m, _BatchNorm):
                     m.eval()

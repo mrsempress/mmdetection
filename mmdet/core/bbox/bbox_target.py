@@ -13,8 +13,9 @@ def bbox_target(pos_bboxes_list,
                 target_means=[.0, .0, .0, .0],
                 target_stds=[1.0, 1.0, 1.0, 1.0],
                 concat=True):
+    # each tensor in the lists is corresponding to a single image.
     labels, label_weights, bbox_targets, bbox_weights = multi_apply(
-        bbox_target_single,
+        bbox_target_single_image,
         pos_bboxes_list,
         neg_bboxes_list,
         pos_gt_bboxes_list,
@@ -32,14 +33,15 @@ def bbox_target(pos_bboxes_list,
     return labels, label_weights, bbox_targets, bbox_weights
 
 
-def bbox_target_single(pos_bboxes,
-                       neg_bboxes,
-                       pos_gt_bboxes,
-                       pos_gt_labels,
-                       cfg,
-                       reg_classes=1,
-                       target_means=[.0, .0, .0, .0],
-                       target_stds=[1.0, 1.0, 1.0, 1.0]):
+def bbox_target_single_image(pos_bboxes,
+                             neg_bboxes,
+                             pos_gt_bboxes,
+                             pos_gt_labels,
+                             cfg,
+                             reg_classes=1,
+                             target_means=[.0, .0, .0, .0],
+                             target_stds=[1.0, 1.0, 1.0, 1.0]):
+    # get the bbox target for a single image.
     num_pos = pos_bboxes.size(0)
     num_neg = neg_bboxes.size(0)
     num_samples = num_pos + num_neg
@@ -51,8 +53,7 @@ def bbox_target_single(pos_bboxes,
         labels[:num_pos] = pos_gt_labels
         pos_weight = 1.0 if cfg.pos_weight <= 0 else cfg.pos_weight
         label_weights[:num_pos] = pos_weight
-        pos_bbox_targets = bbox2delta(pos_bboxes, pos_gt_bboxes, target_means,
-                                      target_stds)
+        pos_bbox_targets = bbox2delta(pos_bboxes, pos_gt_bboxes, target_means, target_stds)
         bbox_targets[:num_pos, :] = pos_bbox_targets
         bbox_weights[:num_pos, :] = 1
     if num_neg > 0:

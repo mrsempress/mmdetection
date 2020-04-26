@@ -4,6 +4,8 @@ from ..geometry import bbox_overlaps
 from .assign_result import AssignResult
 from .base_assigner import BaseAssigner
 
+from mmdet.core.utils.summary import add_summary
+
 
 class MaxIoUAssigner(BaseAssigner):
     """Assign a corresponding gt bbox or background to each bbox.
@@ -48,6 +50,24 @@ class MaxIoUAssigner(BaseAssigner):
         self.ignore_iof_thr = ignore_iof_thr
         self.ignore_wrt_candidates = ignore_wrt_candidates
         self.gpu_assign_thr = gpu_assign_thr
+
+    @staticmethod
+    def proposal_metrics(overlaps):
+        """Add summaries for proposals.
+
+            Args:
+                overlap: nxm, #gt x #bbox
+            """
+        # find best roi for each gt, for summary only
+        best_iou, _ = torch.max(overlaps, dim=1)  # (gt,)
+        mean_best_iou = torch.mean(best_iou).item()
+        summaries = {'mean_best_iou': mean_best_iou}
+
+        if best_iou.size(0) >= 0:
+            for th in [0.3, 0.5, 0.7]:
+                best_over_th = float(torch.sum(best_iou >= th).item()) / float(best_iou.size(0))
+                summaries['best_over_{}'.format(th)] = best_over_th
+        add_summary('proposal', **summaries)
 
     def assign(self, bboxes, gt_bboxes, gt_bboxes_ignore=None, gt_labels=None):
         """Assign gt to bboxes.
@@ -96,20 +116,26 @@ class MaxIoUAssigner(BaseAssigner):
                 gt_labels = gt_labels.cpu()
 
         bboxes = bboxes[:, :4]
-        overlaps = bbox_overlaps(gt_bboxes, bboxes)
+        overlaps = bbox_overlaps(gt_bboxes, bboxes)  # (gt_num, bbox_num)
+        if gt_labels is None:
+            # assume the param 'gt_labels' is None when using RPN.
+            # Note that when imgs_per_gpu > 1, the metrics will only record the last image,
+            # which is acceptable.
+            MaxIoUAssigner.proposal_metrics(overlaps)
 
-        if (self.ignore_iof_thr > 0 and gt_bboxes_ignore is not None
-                and gt_bboxes_ignore.numel() > 0 and bboxes.numel() > 0):
+        if (self.ignore_iof_thr > 0) and (gt_bboxes_ignore is not None) and (
+                gt_bboxes_ignore.numel() > 0):
             if self.ignore_wrt_candidates:
                 ignore_overlaps = bbox_overlaps(
                     bboxes, gt_bboxes_ignore, mode='iof')
-                ignore_max_overlaps, _ = ignore_overlaps.max(dim=1)
+                ignore_max_overlaps, _ = ignore_overlaps.max(dim=1)  # (bbox_num,)
             else:
                 ignore_overlaps = bbox_overlaps(
                     gt_bboxes_ignore, bboxes, mode='iof')
-                ignore_max_overlaps, _ = ignore_overlaps.max(dim=0)
+                ignore_max_overlaps, _ = ignore_overlaps.max(dim=0)  # (bbox_num,)
             overlaps[:, ignore_max_overlaps > self.ignore_iof_thr] = -1
 
+        # 2. assign the label to each box based on the overlap.
         assign_result = self.assign_wrt_overlaps(overlaps, gt_labels)
         if assign_on_cpu:
             assign_result.gt_inds = assign_result.gt_inds.to(device)
@@ -155,23 +181,22 @@ class MaxIoUAssigner(BaseAssigner):
 
         # for each anchor, which gt best overlaps with it
         # for each anchor, the max iou of all gts
-        max_overlaps, argmax_overlaps = overlaps.max(dim=0)
+        max_overlaps, argmax_overlaps = overlaps.max(dim=0)  # (box_num,)
         # for each gt, which anchor best overlaps with it
         # for each gt, the max iou of all proposals
-        gt_max_overlaps, gt_argmax_overlaps = overlaps.max(dim=1)
+        gt_max_overlaps, gt_argmax_overlaps = overlaps.max(dim=1)  # (gt_num,)
 
         # 2. assign negative: below
         if isinstance(self.neg_iou_thr, float):
-            assigned_gt_inds[(max_overlaps >= 0)
-                             & (max_overlaps < self.neg_iou_thr)] = 0
+            assigned_gt_inds[(max_overlaps >= 0) & (max_overlaps < self.neg_iou_thr)] = 0
         elif isinstance(self.neg_iou_thr, tuple):
             assert len(self.neg_iou_thr) == 2
             assigned_gt_inds[(max_overlaps >= self.neg_iou_thr[0])
                              & (max_overlaps < self.neg_iou_thr[1])] = 0
 
         # 3. assign positive: above positive IoU threshold
-        pos_inds = max_overlaps >= self.pos_iou_thr
-        assigned_gt_inds[pos_inds] = argmax_overlaps[pos_inds] + 1
+        pos_inds = max_overlaps >= self.pos_iou_thr  # (box_num,)
+        assigned_gt_inds[pos_inds] = argmax_overlaps[pos_inds] + 1  # slice
 
         # 4. assign fg: for each gt, proposals with highest IoU
         for i in range(num_gts):
@@ -183,12 +208,16 @@ class MaxIoUAssigner(BaseAssigner):
                     assigned_gt_inds[gt_argmax_overlaps[i]] = i + 1
 
         if gt_labels is not None:
-            assigned_labels = assigned_gt_inds.new_zeros((num_bboxes, ))
+            assigned_labels = assigned_gt_inds.new_zeros((num_bboxes,))
             pos_inds = torch.nonzero(assigned_gt_inds > 0).squeeze()
             if pos_inds.numel() > 0:
                 assigned_labels[pos_inds] = gt_labels[
                     assigned_gt_inds[pos_inds] - 1]
         else:
+            add_summary('proposal',
+                        num_fgs=torch.sum(assigned_gt_inds > 0).float().item(),
+                        num_bgs=torch.sum(assigned_gt_inds == 0).float().item(),
+                        num_igs=torch.sum(assigned_gt_inds < 0).float().item())
             assigned_labels = None
 
         return AssignResult(

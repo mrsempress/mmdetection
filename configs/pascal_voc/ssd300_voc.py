@@ -108,7 +108,6 @@ data = dict(
         ann_file=data_root + 'VOC2007/ImageSets/Main/test.txt',
         img_prefix=data_root + 'VOC2007/',
         pipeline=test_pipeline))
-evaluation = dict(interval=1, metric='mAP')
 # optimizer
 optimizer = dict(type='SGD', lr=1e-3, momentum=0.9, weight_decay=5e-4)
 optimizer_config = dict()
@@ -119,20 +118,15 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     step=[16, 20])
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(save_every_n_steps=2500, max_to_keep=1)
 # yapf:disable
-log_config = dict(
-    interval=50,
-    hooks=[
-        dict(type='TextLoggerHook'),
-        # dict(type='TensorboardLoggerHook')
-    ])
+log_config = dict(interval=100)
 # yapf:enable
 # runtime settings
 total_epochs = 24
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = './work_dirs/ssd300_voc'
+work_dir = 'ssd300_voc'
 load_from = None
 resume_from = None
 workflow = [('train', 1)]

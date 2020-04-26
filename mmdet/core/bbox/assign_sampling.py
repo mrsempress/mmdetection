@@ -19,8 +19,7 @@ def build_sampler(cfg, **kwargs):
     elif isinstance(cfg, dict):
         return mmcv.runner.obj_from_dict(cfg, samplers, default_args=kwargs)
     else:
-        raise TypeError('Invalid type {} for building a sampler'.format(
-            type(cfg)))
+        raise TypeError('Invalid type {} for building a sampler'.format(type(cfg)))
 
 
 def assign_and_sample(bboxes, gt_bboxes, gt_bboxes_ignore, gt_labels, cfg):
